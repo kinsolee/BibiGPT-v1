@@ -5,3 +5,6 @@ coverage
 
 # Ignore all HTML files:
 *.html
+
+# Ignore SQL migrations:
+*.sql

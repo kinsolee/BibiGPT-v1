@@ -2,7 +2,7 @@ import { fetchSubtitle } from '~/lib/fetchSubtitle'
 import { ChatGPTAgent, OpenAIStreamPayload } from '~/lib/openai/fetchOpenAIResult'
 import { getSmallSizeTranscripts } from '~/lib/openai/getSmallSizeTranscripts'
 import { getUserSubtitlePrompt, getUserSubtitleWithTimestampPrompt } from '~/lib/openai/prompt'
-import { SummarizeParams } from '~/lib/types'
+import { CommonSubtitleItem, SummarizeParams } from '~/lib/types'
 import { isDev } from '~/utils/env'
 
 const DEFAULT_MODEL = process.env.OPENAI_COMPATIBLE_MODEL || 'gpt-3.5-turbo'
@@ -22,6 +22,9 @@ export async function buildSummarizeOpenAIPayload({ videoConfig, userConfig }: S
   userKey?: string
   baseUrl?: string
   videoId: string
+  title: string | null
+  subtitlesArray: Array<CommonSubtitleItem> | null
+  descriptionText: string | undefined
 }> {
   const { userKey, baseUrl, shouldShowTimestamp } = userConfig || {}
   const { videoId } = videoConfig
@@ -53,5 +56,13 @@ export async function buildSummarizeOpenAIPayload({ videoConfig, userConfig }: S
     stream: Boolean(videoConfig.enableStream ?? true),
   }
 
-  return { openAiPayload, userKey, baseUrl, videoId }
+  return {
+    openAiPayload,
+    userKey,
+    baseUrl,
+    videoId,
+    title: title ?? null,
+    subtitlesArray: subtitlesArray ?? null,
+    descriptionText,
+  }
 }
