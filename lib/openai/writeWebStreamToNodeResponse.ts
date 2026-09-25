@@ -16,9 +16,13 @@ export async function writeWebStreamToNodeResponse(
         res.write(Buffer.from(value))
       }
     }
+    res.end()
+  } catch (error) {
+    // Headers/body were already sent; destroying the socket is the only way to
+    // signal an abnormal end without touching response headers again.
+    console.error('[summarize] response stream aborted:', error)
+    res.destroy(error instanceof Error ? error : new Error(String(error)))
   } finally {
     reader.releaseLock()
   }
-
-  res.end()
 }

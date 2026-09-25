@@ -82,7 +82,7 @@ export const Home: NextPage<{
   const [userKey, setUserKey] = useLocalStorage<string>('user-openai-apikey')
   const [userBaseUrl, setUserBaseUrl] = useLocalStorage<string>('user-openai-base-url')
   const [oauthLoading, setOauthLoading] = useState(false)
-  const { models: openRouterModels, latestModel, loading: modelLoading } = useOpenRouterModels()
+  const { models: openRouterModels, latestModel, defaultModel, loading: modelLoading } = useOpenRouterModels()
   const { loading, summary, resetSummary, summarize } = useSummarize(showSingIn)
   const { toast } = useToast()
   const { analytics } = useAnalytics()
@@ -105,9 +105,11 @@ export const Home: NextPage<{
     }
     const currentModel = getValues('model')
     if (!currentModel) {
-      setValue('model', openRouterModels[0].id)
+      // Prefer the provider's configured default model; the newest catalog
+      // entry may not be callable on the configured provider.
+      setValue('model', defaultModel || openRouterModels[0].id)
     }
-  }, [openRouterModels, getValues, setValue])
+  }, [openRouterModels, defaultModel, getValues, setValue])
 
   useEffect(() => {
     // https://www.youtube.com/watch?v=DHhOgWPKIKU

@@ -1,21 +1,19 @@
 import type { NextApiRequest, NextApiResponse } from 'next'
 
-type OpenRouterModel = {
-  id: string
-  name: string
-  created?: number
-  context_length?: number
-  pricing?: {
-    prompt?: string
-    completion?: string
-  }
-}
+import {
+  buildFallbackCatalog,
+  isTextSummarizationModel,
+  RawCatalogModel,
+  toCatalogModelOption,
+} from '~/lib/models/catalog'
+import { getDefaultModelId } from '~/lib/models/registry'
 
 type OpenRouterModelsResponse = {
-  data?: OpenRouterModel[]
+  data?: RawCatalogModel[]
 }
 
-const OPENROUTER_MODELS_URL = 'https://openrouter.ai/api/v1/models'
+const DEFAULT_CATALOG_URL = 'https://openrouter.ai/api/v1/models'
+const CATALOG_TIMEOUT_MS = 8000
 const MODELS_LIMIT = Number(process.env.OPENROUTER_MODELS_LIMIT || 120)
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -24,8 +22,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return res.status(405).json({ error: 'Method Not Allowed' })
   }
 
+  const catalogUrl = process.env.MODEL_CATALOG_URL || DEFAULT_CATALOG_URL
+  const defaultModel = getDefaultModelId()
+
   try {
-    const response = await fetch(OPENROUTER_MODELS_URL, {
+    const response = await fetch(catalogUrl, {
+      signal: AbortSignal.timeout(CATALOG_TIMEOUT_MS),
       headers: {
         'HTTP-Referer': process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000',
         'X-OpenRouter-Title': 'BibiGPT',
@@ -34,36 +36,49 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     if (!response.ok) {
       const detail = await response.text()
-      return res.status(response.status).json({
-        error: 'Failed to fetch models from OpenRouter',
-        detail: detail.slice(0, 500),
-      })
+      console.error(`model catalog ${catalogUrl} failed: ${response.status} ${detail.slice(0, 200)}`)
+      return res.status(200).json(fallbackPayload(defaultModel, `catalog HTTP ${response.status}`))
     }
 
     const payload = (await response.json()) as OpenRouterModelsResponse
     const models = (payload.data || [])
-      .filter((model) => Boolean(model?.id && model?.name))
+      .filter((model) => Boolean(model?.id))
+      .filter(isTextSummarizationModel)
       .sort((a, b) => (b.created || 0) - (a.created || 0))
       .slice(0, MODELS_LIMIT)
-      .map((model) => ({
-        id: model.id,
-        name: model.name,
-        created: model.created || 0,
-        contextLength: model.context_length || 0,
-        promptPrice: model.pricing?.prompt || '',
-        completionPrice: model.pricing?.completion || '',
-      }))
+      .map(toCatalogModelOption)
+
+    if (!models.length) {
+      return res.status(200).json(fallbackPayload(defaultModel, 'catalog returned no text-capable models'))
+    }
+
+    const latestModel = models[0]
+    const visibleModels = models.some((model) => model.id === defaultModel)
+      ? models
+      : [toCatalogModelOption({ id: defaultModel, name: `${defaultModel}（默认）` }), ...models]
 
     res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate=900')
     return res.status(200).json({
       updatedAt: new Date().toISOString(),
-      latestModel: models[0] || null,
-      models,
+      source: 'catalog',
+      catalogUrl,
+      defaultModel,
+      latestModel,
+      models: visibleModels,
     })
   } catch (error: any) {
-    return res.status(500).json({
-      error: 'Failed to fetch OpenRouter models',
-      message: error?.message || 'Unknown error',
-    })
+    console.error(`model catalog ${catalogUrl} failed: ${error?.message || 'Unknown error'}`)
+    return res.status(200).json(fallbackPayload(defaultModel, error?.message || 'catalog fetch failed'))
+  }
+}
+
+function fallbackPayload(defaultModel: string, reason: string) {
+  return {
+    updatedAt: new Date().toISOString(),
+    source: 'fallback',
+    fallbackReason: reason,
+    defaultModel,
+    latestModel: null,
+    models: buildFallbackCatalog(defaultModel),
   }
 }

@@ -11,12 +11,17 @@ type OpenRouterModelOption = {
 
 type OpenRouterModelsPayload = {
   latestModel: OpenRouterModelOption | null
+  defaultModel?: string
+  source?: 'catalog' | 'fallback'
+  fallbackReason?: string
   models: OpenRouterModelOption[]
 }
 
 export function useOpenRouterModels() {
   const [models, setModels] = useState<OpenRouterModelOption[]>([])
   const [latestModel, setLatestModel] = useState<OpenRouterModelOption | null>(null)
+  const [defaultModel, setDefaultModel] = useState<string>('')
+  const [source, setSource] = useState<'catalog' | 'fallback'>('catalog')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
@@ -36,6 +41,8 @@ export function useOpenRouterModels() {
         const payload = (await response.json()) as OpenRouterModelsPayload
         setModels(payload.models || [])
         setLatestModel(payload.latestModel || null)
+        setDefaultModel(payload.defaultModel || '')
+        setSource(payload.source || 'catalog')
       } catch (error: any) {
         if (error?.name === 'AbortError') {
           return
@@ -59,6 +66,8 @@ export function useOpenRouterModels() {
   return {
     models,
     latestModel,
+    defaultModel,
+    source,
     loading,
     error,
   }
