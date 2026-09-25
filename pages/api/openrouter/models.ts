@@ -26,11 +26,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   const defaultModel = getDefaultModelId()
 
   try {
+    const apiKey = process.env.OPENAI_COMPATIBLE_API_KEY || process.env.OPENAI_API_KEY
     const response = await fetch(catalogUrl, {
       signal: AbortSignal.timeout(CATALOG_TIMEOUT_MS),
       headers: {
         'HTTP-Referer': process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000',
         'X-OpenRouter-Title': 'BibiGPT',
+        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
       },
     })
 

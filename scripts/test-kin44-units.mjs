@@ -56,6 +56,7 @@ const { getCacheId } = require('/tmp/kin44-unit-out/utils/getCacheId.js')
 const {
   resolveModelTarget,
   resolveCacheIdContext,
+  isLikelyThinkingModel,
   SUMMARY_CONFIG_VERSION,
 } = require('/tmp/kin44-unit-out/lib/models/registry.js')
 const { classifyUpstreamError, redactSecrets } = require('/tmp/kin44-unit-out/lib/models/errors.js')
@@ -212,6 +213,21 @@ record(
 )
 const defaultTarget = resolveModelTarget({})
 record('registry falls back to env default model', defaultTarget.model === 'glm-4.6' && defaultTarget.isDefaultModel)
+
+// thinking-model detection
+const thinkingCases = [
+  ['glm-4.6', true],
+  ['glm-4.5-air', true],
+  ['glm-5.3', true],
+  ['o3-mini', true],
+  ['deepseek/deepseek-reasoning', true],
+  ['gpt-6-astra', false],
+  ['gpt-4o-mini', false],
+  ['deepseek/deepseek-flash', false],
+]
+for (const [modelId, expected] of thinkingCases) {
+  record(`thinking detection ${modelId} -> ${expected}`, isLikelyThinkingModel(modelId) === expected)
+}
 
 const failed = results.filter((r) => !r.pass)
 console.log(`\n${results.length - failed.length}/${results.length} unit checks passed`)

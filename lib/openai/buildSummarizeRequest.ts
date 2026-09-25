@@ -2,7 +2,12 @@ import { fetchSubtitle } from '~/lib/fetchSubtitle'
 import { ChatGPTAgent, OpenAIStreamPayload } from '~/lib/openai/fetchOpenAIResult'
 import { getSmallSizeTranscripts } from '~/lib/openai/getSmallSizeTranscripts'
 import { getUserSubtitlePrompt, getUserSubtitleWithTimestampPrompt } from '~/lib/openai/prompt'
-import { resolveCacheIdContext, resolveModelTarget } from '~/lib/models/registry'
+import {
+  isLikelyThinkingModel,
+  resolveCacheIdContext,
+  resolveModelTarget,
+  THINKING_MODEL_MIN_OUTPUT_TOKENS,
+} from '~/lib/models/registry'
 import { CacheIdContext } from '~/lib/models/types'
 import { SummarizeParams } from '~/lib/types'
 import { isDev } from '~/utils/env'
@@ -49,10 +54,13 @@ export async function buildSummarizeOpenAIPayload({ videoConfig, userConfig }: S
   }
 
   const modelTarget = resolveModelTarget({ model: videoConfig.model, baseUrl })
+  const detailTokens = Number(videoConfig.detailLevel) || (userKey ? 800 : 600)
   const openAiPayload: OpenAIStreamPayload = {
     model: modelTarget.model,
     messages: [{ role: ChatGPTAgent.user, content: userPrompt }],
-    max_tokens: Number(videoConfig.detailLevel) || (userKey ? 800 : 600),
+    max_tokens: isLikelyThinkingModel(modelTarget.model)
+      ? Math.max(detailTokens, THINKING_MODEL_MIN_OUTPUT_TOKENS)
+      : detailTokens,
     stream: Boolean(videoConfig.enableStream ?? true),
   }
 
