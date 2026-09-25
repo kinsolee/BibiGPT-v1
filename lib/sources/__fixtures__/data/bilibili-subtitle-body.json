@@ -1,0 +1,14 @@
+{
+  "body": [
+    { "from": 0.0, "content": "大家好" },
+    { "from": 2.0, "content": "今天讲点啥" },
+    { "from": 4.5, "content": "第三句" },
+    { "from": 7.0, "content": "第四句" },
+    { "from": 9.2, "content": "第五句" },
+    { "from": 11.8, "content": "第六句" },
+    { "from": 14.0, "content": "第七句" },
+    { "from": 16.6, "content": "第八句" },
+    { "from": 19.0, "content": "第九句" },
+    { "from": 21.4, "content": "第十句" }
+  ]
+}

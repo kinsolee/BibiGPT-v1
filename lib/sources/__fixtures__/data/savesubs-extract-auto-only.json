@@ -1,0 +1,7 @@
+{
+  "response": {
+    "title": "Auto captions only",
+    "duration_raw": "42",
+    "formats": [{ "quality": "English (auto-generated)", "url": "/action/extract/1-1-1/auto" }]
+  }
+}

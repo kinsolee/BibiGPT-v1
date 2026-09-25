@@ -1,0 +1,18 @@
+{
+  "code": 0,
+  "message": "0",
+  "ttl": 1,
+  "data": {
+    "aid": 865462240,
+    "bvid": "BV1GJ411x7h7",
+    "title": "测试用多分P视频",
+    "desc": "这是视频简介",
+    "dynamic": "",
+    "pic": "https://i0.hdslb.com/bfs/archive/cover.jpg",
+    "duration": 100,
+    "pages": [
+      { "page": 1, "part": "第一P", "cid": 1035524241, "duration": 30 },
+      { "page": 2, "part": "第二P", "cid": 1035524242, "duration": 70 }
+    ]
+  }
+}

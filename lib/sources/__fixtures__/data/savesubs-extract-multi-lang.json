@@ -1,0 +1,14 @@
+{
+  "response": {
+    "title": "Microsoft vs Google: AI War Explained | tech",
+    "duration": "13 minutes and 15 seconds",
+    "duration_raw": "795",
+    "uploader": "Joma Tech / 2023-02-20",
+    "thumbnail": "//i.ytimg.com/vi/BdHaeczStRA/mqdefault.jpg",
+    "formats": [
+      { "quality": "English", "url": "/action/extract/9-9-9/english" },
+      { "quality": "English (auto-generated)", "url": "/action/extract/9-9-9/auto" },
+      { "quality": "zh-CN", "url": "/action/extract/9-9-9/zh" }
+    ]
+  }
+}

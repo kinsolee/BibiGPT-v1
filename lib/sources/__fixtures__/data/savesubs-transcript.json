@@ -1,0 +1,12 @@
+[
+  { "start": 0.48, "lines": ["hello", "world"] },
+  { "start": 2.16, "lines": ["this is a fixture transcript"] },
+  { "start": 4.02, "lines": ["third cue"] },
+  { "start": 6.1, "lines": ["fourth cue"] },
+  { "start": 8.44, "lines": ["fifth cue"] },
+  { "start": 10.2, "lines": ["sixth cue"] },
+  { "start": 12.66, "lines": ["seventh cue"] },
+  { "start": 14.08, "lines": ["eighth cue"] },
+  { "start": 16.9, "lines": ["ninth cue"] },
+  { "start": 18.4, "lines": ["tenth cue"] }
+]

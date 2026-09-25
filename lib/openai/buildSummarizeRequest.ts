@@ -1,7 +1,8 @@
-import { fetchSubtitle } from '~/lib/fetchSubtitle'
+import { fetchSubtitle, SubtitleFetchResult } from '~/lib/fetchSubtitle'
 import { ChatGPTAgent, OpenAIStreamPayload } from '~/lib/openai/fetchOpenAIResult'
 import { getSmallSizeTranscripts } from '~/lib/openai/getSmallSizeTranscripts'
 import { getUserSubtitlePrompt, getUserSubtitleWithTimestampPrompt } from '~/lib/openai/prompt'
+import { sourceErrorCodeToHttpStatus, SourceError } from '~/lib/sources/types'
 import { SummarizeParams } from '~/lib/types'
 import { isDev } from '~/utils/env'
 
@@ -30,7 +31,17 @@ export async function buildSummarizeOpenAIPayload({ videoConfig, userConfig }: S
     throw new SummarizeRequestError(500, 'No videoId in the request')
   }
 
-  const { title, subtitlesArray, descriptionText } = await fetchSubtitle(videoConfig, shouldShowTimestamp)
+  let subtitles: SubtitleFetchResult
+  try {
+    subtitles = await fetchSubtitle(videoConfig, shouldShowTimestamp)
+  } catch (error) {
+    if (error instanceof SourceError) {
+      // 错误码进 message 前缀，UI/API 可区分 NO_TRANSCRIPT / AUTH_REQUIRED / SOURCE_UNAVAILABLE / RATE_LIMITED
+      throw new SummarizeRequestError(sourceErrorCodeToHttpStatus(error.code), `${error.code}: ${error.message}`)
+    }
+    throw error
+  }
+  const { title, subtitlesArray, descriptionText } = subtitles
   if (!subtitlesArray && !descriptionText) {
     console.error('No subtitle in the video: ', videoId)
     throw new SummarizeRequestError(501, 'No subtitle in the video')
