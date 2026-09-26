@@ -45,6 +45,8 @@ export interface JobStore {
   acquireJobLock(jobId: string, holderId: string, ttlMs: number): Promise<boolean>
   /** 只有当前持有者能释放（防误删他人锁）；非持有者调用为 no-op */
   releaseJobLock(jobId: string, holderId: string): Promise<void>
+  /** 续约：仅当锁仍由该持有者持有时刷新 TTL；已被抢走/过期返回 false */
+  renewJobLock(jobId: string, holderId: string, ttlMs: number): Promise<boolean>
   /** 是否有实例持有该 job 的执行锁（含 TTL 未过期的判断） */
   hasJobLock(jobId: string): Promise<boolean>
   /** 取消请求落共享存储：跨实例的 worker 在步骤检查点读取并兑现 */
@@ -132,6 +134,15 @@ export class MemoryJobStore implements JobStore {
   async hasJobLock(jobId: string) {
     const existing = this.locks.get(jobId)
     return Boolean(existing && existing.expiresAtMs > Date.now())
+  }
+
+  async renewJobLock(jobId: string, holderId: string, ttlMs: number) {
+    const existing = this.locks.get(jobId)
+    if (!existing || existing.holderId !== holderId) {
+      return false
+    }
+    existing.expiresAtMs = Date.now() + ttlMs
+    return true
   }
 
   async requestCancel(jobId: string) {
@@ -233,6 +244,16 @@ class UpstashJobStore implements JobStore {
 
   async hasJobLock(jobId: string) {
     return (await this.redis.exists(this.lockKey(jobId))) > 0
+  }
+
+  async renewJobLock(jobId: string, holderId: string, ttlMs: number) {
+    // 原子续约：锁仍属于该持有者才刷新 TTL，防止过期后被他人抢走时误续
+    const script = `if redis.call("get", KEYS[1]) == ARGV[1] then
+  return redis.call("set", KEYS[1], ARGV[1], "PX", ARGV[2])
+end
+return 0`
+    const result = await this.redis.eval<string[], unknown>(script, [this.lockKey(jobId)], [holderId, String(ttlMs)])
+    return result === 'OK'
   }
 
   private cancelKey(jobId: string) {

@@ -50,6 +50,8 @@ export function buildChunkUserPrompt(input: {
 /**
  * reduce 提示词：把按时间顺序的各段摘要合并成全局 summary + highlights + chapters。
  * 与 fast path 的输出模板保持同构（## Summary / ## Highlights），额外给出章节划分。
+ * intermediate=true 为分层中间层：只做要点归并（无 chapters），供超长 transcript
+ * 的多级 reduce 使用。
  */
 export function buildReduceUserPrompt(input: {
   title: string | null
@@ -57,8 +59,9 @@ export function buildReduceUserPrompt(input: {
   chunkOutputs: string[]
   videoConfig: VideoConfig
   shouldShowTimestamp?: boolean
+  intermediate?: boolean
 }) {
-  const { title, chunks, chunkOutputs, videoConfig, shouldShowTimestamp } = input
+  const { title, chunks, chunkOutputs, videoConfig, shouldShowTimestamp, intermediate } = input
   const language = videoConfig.outputLanguage || DEFAULT_LANGUAGE
   const languageName = LANGUAGE_CODE_TO_ENGLISH_NAME[language] || language
   const sentenceCount = videoConfig.sentenceNumber || 7
@@ -68,8 +71,9 @@ export function buildReduceUserPrompt(input: {
 
   const sections = chunkOutputs
     .map((output, position) => {
+      // 分层 reduce 时 sections 数与 chunks 不对应（中间层归并结果），越界则省略时间范围
       const chunk = chunks[position]
-      const range = chunkRangeLabel(chunk)
+      const range = chunk ? chunkRangeLabel(chunk) : ''
       const header = range
         ? `Section ${position + 1}/${chunkOutputs.length} (${range}):`
         : `Section ${position + 1}/${chunkOutputs.length}:`
@@ -81,9 +85,11 @@ export function buildReduceUserPrompt(input: {
     ? '- keep the start timestamp format `- seconds - ` in highlight bullets when the section summaries carry it\n'
     : ''
 
-  const prompt = `Your output should use the following template:\n## Summary\n## Highlights\n- ${emojiTemplateText}Bulletpoint\n## Chapters\n- ${emojiTemplateText}mm:ss Chapter title\n\nYour task is to act as the final editor of a long-video summary pipeline. You are given the section-by-section summaries (in chronological order) of one long video. Merge them into one coherent summary of the WHOLE video:\n- "## Summary": one short paragraph summarizing the whole video\n- "## Highlights": up to ${sentenceCount} concise bullet points covering the most important content across ALL sections, each bullet point is at least ${wordsCount} words\n- "## Chapters": divide the whole video into 3-8 chapters by time range, one line each in the format "- mm:ss Chapter title — short description"\n\nRules:\n${timestampRule}- deduplicate repeated points across sections; do not invent content not present in the section summaries\n- there may be typos, please correct them\n\nReply in ${languageName} Language.`
+  const template = intermediate
+    ? `Your output should use the following template:\n## Consolidated notes\n- ${emojiTemplateText}Bulletpoint\n\nYour task is to merge the given section summaries (parts of one long video) into a shorter consolidated list that keeps ALL distinct key points and their timestamps, drops duplicates and filler. Do not invent content.\n\nReply in ${languageName} Language.`
+    : `Your output should use the following template:\n## Summary\n## Highlights\n- ${emojiTemplateText}Bulletpoint\n## Chapters\n- ${emojiTemplateText}mm:ss Chapter title\n\nYour task is to act as the final editor of a long-video summary pipeline. You are given the section-by-section summaries (in chronological order) of one long video. Merge them into one coherent summary of the WHOLE video:\n- "## Summary": one short paragraph summarizing the whole video\n- "## Highlights": up to ${sentenceCount} concise bullet points covering the most important content across ALL sections, each bullet point is at least ${wordsCount} words\n- "## Chapters": divide the whole video into 3-8 chapters by time range, one line each in the format "- mm:ss Chapter title — short description"\n\nRules:\n${timestampRule}- deduplicate repeated points across sections; do not invent content not present in the section summaries\n- there may be typos, please correct them\n\nReply in ${languageName} Language.`
 
   return `Title: "${(title ?? 'Untitled')
     .replace(/\n+/g, ' ')
-    .trim()}"\nSection summaries:\n${sections}\n\nInstructions: ${prompt}`
+    .trim()}"\nSection summaries:\n${sections}\n\nInstructions: ${template}`
 }

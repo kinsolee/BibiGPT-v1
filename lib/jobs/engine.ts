@@ -33,6 +33,7 @@ export interface JobEngineOptions {
   lockTtlMs?: number
   lockWaitMs?: number
   lockRetryIntervalMs?: number
+  lockRenewIntervalMs?: number
   now?: () => number
   sleep?: (ms: number) => Promise<void>
 }
@@ -125,6 +126,7 @@ export class JobEngine {
   private readonly lockTtlMs: number
   private readonly lockWaitMs: number
   private readonly lockRetryIntervalMs: number
+  private readonly lockRenewIntervalMs: number
   private readonly now: () => number
   private readonly sleep: (ms: number) => Promise<void>
   private readonly jobLocks = createKeyedMutex()
@@ -143,6 +145,11 @@ export class JobEngine {
     this.lockTtlMs = Math.max(1, options.lockTtlMs ?? DEFAULT_JOB_LOCK_TTL_MS)
     this.lockWaitMs = Math.max(0, options.lockWaitMs ?? DEFAULT_JOB_LOCK_WAIT_MS)
     this.lockRetryIntervalMs = Math.max(1, options.lockRetryIntervalMs ?? JOB_LOCK_RETRY_INTERVAL_MS)
+    // 续约间隔默认取 TTL 的 1/3（下限 1s），超长 job 执行期间锁不会因 TTL 过期被抢
+    this.lockRenewIntervalMs = Math.max(
+      1,
+      options.lockRenewIntervalMs ?? Math.max(1_000, Math.floor(this.lockTtlMs / 3)),
+    )
     this.now = options.now ?? (() => Date.now())
     this.sleep = options.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)))
   }
@@ -242,32 +249,7 @@ export class JobEngine {
     forceNewResult: boolean,
   ): Promise<{ snapshot: JobSnapshot; reused: boolean }> {
     const store = this.options.store
-    let record = await store.loadJob(jobId)
-    let steps = await store.loadSteps(jobId)
-
-    if (!record || !steps) {
-      record = {
-        id: jobId,
-        digest,
-        kind: 'summary',
-        videoId: params.videoConfig.videoId,
-        status: 'queued',
-        attempt: 0,
-        createdAt: this.now(),
-        updatedAt: this.now(),
-        startedAt: null,
-        finishedAt: null,
-        checkpoint: [],
-        error: null,
-        resultText: null,
-        // apiKey/userKey 只随运行时参数传递，持久化记录一律剥离
-        params: stripSecrets(params),
-      }
-      steps = buildSteps(params.chunks.length, this.stepMaxAttempts)
-      await store.saveJob(record)
-      await store.saveSteps(jobId, steps)
-      await store.addActiveIndex(jobId, record.createdAt)
-    }
+    let { record, steps } = await this.ensureJobRecord(jobId, digest, params)
 
     // 幂等复用：已完成且未要求强制重新生成
     if (record.status === 'succeeded' && record.resultText && !forceNewResult) {
@@ -288,6 +270,18 @@ export class JobEngine {
     if (lockOutcome !== 'acquired') {
       throw new JobFailureError('JOB_LOCK_BUSY', `another instance is running job ${jobId}`, 'failed')
     }
+
+    // 执行期间周期续约，防止超长 job 超过锁 TTL 后被第二实例抢入
+    const renewTimer = setInterval(() => {
+      void store
+        .renewJobLock(jobId, holderId, this.lockTtlMs)
+        .then((renewed) => {
+          if (!renewed) {
+            console.error(`[jobs] lock renew rejected for ${jobId} (lost lock?)`)
+          }
+        })
+        .catch((error) => console.error(`[jobs] lock renew failed for ${jobId}:`, error))
+    }, this.lockRenewIntervalMs)
 
     // 强制重新生成：清空全部已完成步骤与结果，回到全量重跑（在持锁后落盘）
     if (forceNewResult) {
@@ -318,6 +312,7 @@ export class JobEngine {
     } finally {
       this.runningJobs.delete(jobId)
       this.canceledJobs.delete(jobId)
+      clearInterval(renewTimer)
       await store.releaseJobLock(jobId, holderId)
       await store.clearCancelFlag(jobId).catch(() => undefined)
     }
@@ -328,6 +323,42 @@ export class JobEngine {
       throw new Error(`[jobs] job record vanished during execution: ${jobId}`)
     }
     return { snapshot: { record: finalRecord, steps: finalSteps }, reused: false }
+  }
+
+  /** load-or-create：job 记录与 steps 不存在时落盘 queued 初始态（幂等） */
+  async ensureJobRecord(
+    jobId: string,
+    digest: string,
+    params: SummaryJobParams,
+  ): Promise<{ record: JobRecord; steps: JobStepRecord[] }> {
+    const store = this.options.store
+    const existingRecord = await store.loadJob(jobId)
+    const existingSteps = await store.loadSteps(jobId)
+    if (existingRecord && existingSteps) {
+      return { record: existingRecord, steps: existingSteps }
+    }
+    const record: JobRecord = {
+      id: jobId,
+      digest,
+      kind: 'summary',
+      videoId: params.videoConfig.videoId,
+      status: 'queued',
+      attempt: 0,
+      createdAt: this.now(),
+      updatedAt: this.now(),
+      startedAt: null,
+      finishedAt: null,
+      checkpoint: [],
+      error: null,
+      resultText: null,
+      // apiKey/userKey 只随运行时参数传递，持久化记录一律剥离
+      params: stripSecrets(params),
+    }
+    const steps = buildSteps(params.chunks.length, this.stepMaxAttempts)
+    await store.saveJob(record)
+    await store.saveSteps(jobId, steps)
+    await store.addActiveIndex(jobId, record.createdAt)
+    return { record, steps }
   }
 
   /**

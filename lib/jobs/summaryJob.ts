@@ -4,6 +4,7 @@ import { Redis } from '@upstash/redis'
 
 import { isLikelyThinkingModel, resolveCacheIdContext, THINKING_MODEL_MIN_OUTPUT_TOKENS } from '~/lib/models/registry'
 import { getCacheId } from '~/utils/getCacheId'
+import { getUtf8ByteLength } from '~/lib/openai/getSmallSizeTranscripts'
 import { ChatGPTAgent, fetchOpenAIResult, OpenAIStreamPayload } from '~/lib/openai/fetchOpenAIResult'
 import { buildChunkUserPrompt, buildReduceUserPrompt } from '~/lib/jobs/prompts'
 import { JobEngine, JobFailureError, StepRunner } from '~/lib/jobs/engine'
@@ -87,13 +88,86 @@ export function buildSummaryJobDigest(input: SummaryJobInput) {
   return createHash('sha256').update(canonicalJson(material), 'utf8').digest('hex').slice(0, 32)
 }
 
+function toSummaryJobParams(input: SummaryJobInput): SummaryJobParams {
+  return {
+    videoConfig: input.videoConfig,
+    userConfig: input.userConfig,
+    title: input.title,
+    chunks: input.chunks,
+    model: input.model,
+    provider: input.provider,
+    baseUrl: input.baseUrl,
+    promptVersion: input.promptVersion,
+    detailTokens: input.detailTokens,
+    apiKey: input.apiKey,
+  }
+}
+
 function outputTokensFor(model: string, detailTokens: number, isReduce: boolean) {
   const base = isReduce ? Math.max(detailTokens * 2, 1000) : detailTokens
   return isLikelyThinkingModel(model) ? Math.max(base, THINKING_MODEL_MIN_OUTPUT_TOKENS) : base
 }
 
+/** 单次 reduce 请求的输入字节上界；超出则分层（hierarchical）归并后再发最终请求 */
+export const DEFAULT_REDUCE_INPUT_BYTE_LIMIT = Number(process.env.BIBI_JOB_REDUCE_INPUT_BYTES) || 20_000
+
+/**
+ * 分层 reduce 分组：保序贪心装箱，每组（含 \n\n 分隔）≤ maxBytes；
+ * 单条 section 超限则自成一组（由上层中间层压缩后自然收敛）。
+ */
+export function groupSectionsForReduce(sections: string[], maxBytes: number): string[][] {
+  const groups: string[][] = []
+  let current: string[] = []
+  let currentBytes = 0
+  for (const section of sections) {
+    const bytes = getUtf8ByteLength(section)
+    const separatorBytes = current.length > 0 ? 2 : 0
+    if (current.length > 0 && currentBytes + separatorBytes + bytes > maxBytes) {
+      groups.push(current)
+      current = [section]
+      currentBytes = bytes
+    } else {
+      current.push(section)
+      currentBytes += separatorBytes + bytes
+    }
+  }
+  if (current.length > 0) {
+    groups.push(current)
+  }
+  return groups
+}
+
 /** 生产 StepRunner：chunk/reduce 都走非流式 generateText，可整体落缓存与重试 */
 export function createOpenAIStepRunner(): StepRunner {
+  const callReduceModel = async (params: SummaryJobParams, sections: string[], intermediate: boolean) => {
+    if (sections.some((output) => !output.trim())) {
+      throw new JobFailureError('REDUCE_INPUT_EMPTY', 'reduce received empty chunk output', 'failed')
+    }
+    const prompt = buildReduceUserPrompt({
+      title: params.title,
+      chunks: params.chunks,
+      chunkOutputs: sections,
+      videoConfig: params.videoConfig,
+      shouldShowTimestamp: params.userConfig.shouldShowTimestamp,
+      intermediate,
+    })
+    const syntheticVideoConfig = { ...params.videoConfig, videoId: `${params.videoConfig.videoId}#reduce` }
+    const payload: OpenAIStreamPayload = {
+      model: params.model,
+      messages: [{ role: ChatGPTAgent.user, content: prompt }],
+      max_tokens: outputTokensFor(params.model, params.detailTokens, true),
+      stream: false,
+    }
+    const result = await fetchOpenAIResult(
+      payload,
+      params.apiKey,
+      syntheticVideoConfig,
+      params.baseUrl,
+      resolveCacheIdContext({ baseUrl: params.baseUrl, model: params.model }),
+    )
+    return typeof result === 'string' ? result : String(result)
+  }
+
   return {
     async runChunk(params: SummaryJobParams, chunkIndex: number): Promise<string> {
       const chunk = params.chunks[chunkIndex]
@@ -128,32 +202,30 @@ export function createOpenAIStepRunner(): StepRunner {
       return typeof result === 'string' ? result : String(result)
     },
 
+    /**
+     * 分层 reduce：拼接后的 section 摘要超过单请求输入上界
+     * （DEFAULT_REDUCE_INPUT_BYTE_LIMIT）时，先按组做中间层归并
+     * （consolidated notes），逐层收敛后再发最终 reduce。
+     * 中间层串行执行，共享本步骤的 step 超时/重试预算（层数≤8；极端
+     * 不收敛时以最终 reduce 的截断语义兜底）。
+     */
     async runReduce(params: SummaryJobParams, chunkOutputs: string[]): Promise<string> {
-      if (chunkOutputs.some((output) => !output.trim())) {
-        throw new JobFailureError('REDUCE_INPUT_EMPTY', 'reduce received empty chunk output', 'failed')
+      let sections = chunkOutputs.map((output) => output.trim())
+      let levels = 0
+      while (
+        sections.length > 1 &&
+        getUtf8ByteLength(sections.join('\n\n')) > DEFAULT_REDUCE_INPUT_BYTE_LIMIT &&
+        levels < 8
+      ) {
+        levels += 1
+        const groups = groupSectionsForReduce(sections, DEFAULT_REDUCE_INPUT_BYTE_LIMIT)
+        const merged: string[] = []
+        for (const group of groups) {
+          merged.push(await callReduceModel(params, group, true))
+        }
+        sections = merged
       }
-      const prompt = buildReduceUserPrompt({
-        title: params.title,
-        chunks: params.chunks,
-        chunkOutputs,
-        videoConfig: params.videoConfig,
-        shouldShowTimestamp: params.userConfig.shouldShowTimestamp,
-      })
-      const syntheticVideoConfig = { ...params.videoConfig, videoId: `${params.videoConfig.videoId}#reduce` }
-      const payload: OpenAIStreamPayload = {
-        model: params.model,
-        messages: [{ role: ChatGPTAgent.user, content: prompt }],
-        max_tokens: outputTokensFor(params.model, params.detailTokens, true),
-        stream: false,
-      }
-      const result = await fetchOpenAIResult(
-        payload,
-        params.apiKey,
-        syntheticVideoConfig,
-        params.baseUrl,
-        resolveCacheIdContext({ baseUrl: params.baseUrl, model: params.model }),
-      )
-      return typeof result === 'string' ? result : String(result)
+      return callReduceModel(params, sections, false)
     },
   }
 }
@@ -201,16 +273,19 @@ export async function writeJobResultToCanonicalCache(input: SummaryJobInput, sum
 }
 
 /**
- * 入队即返回（opt-in 异步模式）：不等待执行，立即返回 jobId，
- * 调用方可轮询 GET /api/sumup?jobId=... 获取状态。
+ * 入队即返回（opt-in 异步模式）：先把 queued 记录同步落盘（客户端拿到 202
+ * 立即轮询不会 404），再后台驱动执行，立即返回 jobId。
  * 仅适用于自托管长驻进程（Next 自定义 server/docker），API handler 返回后
  * 进程继续执行后台 promise。
  */
-export function startSummaryJobInBackground(
+export async function startSummaryJobInBackground(
   input: SummaryJobInput,
   options: { forceNewResult?: boolean; engine?: JobEngine } = {},
-): { jobId: string } {
-  const jobId = `job_${buildSummaryJobDigest(input)}`
+): Promise<{ jobId: string }> {
+  const digest = buildSummaryJobDigest(input)
+  const jobId = `job_${digest}`
+  const engine = options.engine ?? getSharedJobEngine()
+  await engine.ensureJobRecord(jobId, digest, toSummaryJobParams(input))
   void runSummaryToCompletion(input, options).catch((error: unknown) => {
     console.error(`[jobs] background job ${jobId} failed:`, error instanceof Error ? error.message : error)
   })
@@ -227,18 +302,7 @@ export async function runSummaryToCompletion(
 ): Promise<SummaryJobResult> {
   const digest = buildSummaryJobDigest(input)
   const engine = options.engine ?? getSharedJobEngine()
-  const params: SummaryJobParams = {
-    videoConfig: input.videoConfig,
-    userConfig: input.userConfig,
-    title: input.title,
-    chunks: input.chunks,
-    model: input.model,
-    provider: input.provider,
-    baseUrl: input.baseUrl,
-    promptVersion: input.promptVersion,
-    detailTokens: input.detailTokens,
-    apiKey: input.apiKey,
-  }
+  const params = toSummaryJobParams(input)
   const { snapshot, reused } = await engine.runSummaryJob(params, digest, {
     forceNewResult: options.forceNewResult,
   })

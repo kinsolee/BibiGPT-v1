@@ -157,7 +157,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         apiKey,
       }
       if (process.env.BIBI_JOB_ASYNC_RETURN === '1') {
-        const { jobId } = startSummaryJobInBackground(jobInput)
+        const { jobId } = await startSummaryJobInBackground(jobInput)
         return res.status(202).json({ jobId, status: 'queued', poll: `/api/sumup?jobId=${jobId}` })
       }
       const result = await runSummaryToCompletion(jobInput)
