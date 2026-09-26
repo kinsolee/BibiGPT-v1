@@ -371,8 +371,16 @@ export async function startSummaryJobInBackground(
   const jobId = `job_${digest}`
   const engine = options.engine ?? getSharedJobEngine()
   await engine.ensureJobRecord(jobId, digest, toSummaryJobParams(input))
-  void runSummaryToCompletion(input, options).catch((error: unknown) => {
-    console.error(`[jobs] background job ${jobId} failed:`, error instanceof Error ? error.message : error)
+  void runSummaryToCompletion(input, options).catch(async (error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error)
+    console.error(`[jobs] background job ${jobId} failed:`, message)
+    // 启动阶段异常（store 错误/锁超时等）时 engine 可能没走到 finalize：
+    // 把未终态记录迁移为 failed，轮询才能看到可重试的终态而不是永远 queued
+    try {
+      await engine.failJobIfNotTerminal(jobId, 'BACKGROUND_START_FAILED', message)
+    } catch (failoverError) {
+      console.error(`[jobs] background job ${jobId} failover failed:`, failoverError)
+    }
   })
   return { jobId }
 }

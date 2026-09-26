@@ -361,21 +361,6 @@ export class JobEngine {
         })
     }, this.lockRenewIntervalMs)
 
-    // 强制重新生成：清空全部已完成步骤与结果，回到全量重跑（在持锁后落盘）
-    if (forceNewResult) {
-      steps = buildSteps(params.chunks.length, this.stepMaxAttempts)
-      record = {
-        ...record,
-        status: 'queued',
-        resultText: null,
-        checkpoint: [],
-        error: null,
-        updatedAt: this.now(),
-      }
-      await store.saveSteps(jobId, steps)
-      await store.saveJob(record)
-    }
-
     // 运行时参数：持久化 params（无凭据）+ 本次请求带来的凭据
     const runParams: SummaryJobParams = {
       ...record.params,
@@ -387,14 +372,35 @@ export class JobEngine {
     this.lostLockJobs.delete(jobId)
     this.runningJobs.add(jobId)
     try {
+      // 强制重新生成：清空全部已完成步骤与结果，回到全量重跑（在持锁后落盘）。
+      // 写入放在 cleanup 保护段内：重置持久化失败（如瞬时 Redis 错误）时
+      // renewTimer/锁也会在 finally 中被清理，不会无限续约把 job 锁死
+      if (forceNewResult) {
+        steps = buildSteps(params.chunks.length, this.stepMaxAttempts)
+        record = {
+          ...record,
+          status: 'queued',
+          resultText: null,
+          checkpoint: [],
+          error: null,
+          updatedAt: this.now(),
+        }
+        await store.saveSteps(jobId, steps)
+        await store.saveJob(record)
+      }
       await this.executeJob(jobId, record, steps, runParams)
     } finally {
       this.runningJobs.delete(jobId)
       this.canceledJobs.delete(jobId)
       this.lostLockJobs.delete(jobId)
       clearInterval(renewTimer)
-      await store.releaseJobLock(jobId, holderId)
-      await store.clearCancelFlag(jobId).catch(() => undefined)
+      // 仅在仍持有执行权时才清共享取消标志并释放锁：丢锁后标志归当前
+      // 持有者管理，旧 worker 清掉会让新持有者错失未兑现的取消请求
+      const stillHolds = await store.renewJobLock(jobId, holderId, this.lockTtlMs).catch(() => false)
+      if (stillHolds) {
+        await store.clearCancelFlag(jobId).catch(() => undefined)
+        await store.releaseJobLock(jobId, holderId)
+      }
     }
 
     const finalRecord = await store.loadJob(jobId)
@@ -478,6 +484,19 @@ export class JobEngine {
     }
   }
 
+  /**
+   * 异常路径兜底（如后台启动失败）：job 尚未到终态时落 failed，
+   * 保证轮询方能观察到终态/可重试状态；已终态则不动。返回是否迁移。
+   */
+  async failJobIfNotTerminal(jobId: string, code: string, message: string): Promise<boolean> {
+    const snapshot = await this.getJob(jobId)
+    if (!snapshot || isTerminalJobStatus(snapshot.record.status)) {
+      return false
+    }
+    await this.finalizeFailed(jobId, { code, message })
+    return true
+  }
+
   private async executeJob(
     jobId: string,
     record: JobRecord,
@@ -528,10 +547,14 @@ export class JobEngine {
       return persistChain
     }
     const persistStep = async (index: number, patch: Partial<JobStepRecord>) => {
+      // 丢锁后不再写任何状态：在途 provider 调用 resolve 的完成回调也必须
+      // 先验证执行权，否则会覆盖新持有者的进度
+      this.assertLockHeld(jobId)
       steps = steps.map((step) => (step.index === index ? { ...step, ...patch } : step))
       await enqueuePersist(() => store.saveSteps(jobId, steps))
     }
     const persistJob = async () => {
+      this.assertLockHeld(jobId)
       const succeededChunks = steps
         .filter((step) => step.kind === 'chunk' && step.status === 'succeeded')
         .map((step) => step.chunkIndex!)
@@ -663,6 +686,7 @@ export class JobEngine {
       if (await this.checkCanceled(jobId)) {
         throw new JobFailureError('CANCELED', 'job canceled by user', 'canceled')
       }
+      this.assertLockHeld(jobId)
       attempt += 1
       await commit({ status: 'running', attempt, startedAt: this.now(), error: null })
       const attemptPromise =
@@ -682,6 +706,11 @@ export class JobEngine {
         await commit({ status: 'succeeded', output: text, finishedAt: this.now(), error: null })
         return
       } catch (error) {
+        // 丢锁后连 failed/queued 状态都不写（终态与新进度归当前持有者），
+        // 直接以 LOST_LOCK 放弃本步骤
+        if (this.lostLockJobs.has(jobId)) {
+          throw new JobFailureError('LOST_LOCK', `execution abandoned: job lock lost for ${jobId}`, 'failed')
+        }
         // 超时只是放弃等待，provider 调用仍在途。fetchOpenAIResult 不支持
         // abortSignal，无法中止：有界等待它 settle（上界 = 一个超时周期）。
         // - settle：正常进入重试判定，保证重试与孤儿不同时在途（并发上限不被突破）
