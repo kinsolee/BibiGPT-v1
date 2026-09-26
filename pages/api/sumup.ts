@@ -2,6 +2,7 @@ import type { NextApiRequest, NextApiResponse } from 'next'
 import { buildSummarizeOpenAIPayload, SummarizeRequestError } from '~/lib/openai/buildSummarizeRequest'
 import { fetchOpenAIResult } from '~/lib/openai/fetchOpenAIResult'
 import { selectApiKeyAndActivatedLicenseKey } from '~/lib/openai/selectApiKeyAndActivatedLicenseKey'
+import { classifyUpstreamError } from '~/lib/models/errors'
 import { SummarizeParams } from '~/lib/types'
 import { writeWebStreamToNodeResponse } from '~/lib/openai/writeWebStreamToNodeResponse'
 
@@ -23,9 +24,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   try {
     const normalizedParams = summarizeParams as SummarizeParams
     const { videoConfig } = normalizedParams
-    const { openAiPayload, userKey, baseUrl, videoId } = await buildSummarizeOpenAIPayload(normalizedParams)
+    const { openAiPayload, userKey, baseUrl, cacheContext, videoId } = await buildSummarizeOpenAIPayload(
+      normalizedParams,
+    )
     const openaiApiKey = await selectApiKeyAndActivatedLicenseKey(userKey, videoId)
-    const result = await fetchOpenAIResult(openAiPayload, openaiApiKey, videoConfig, baseUrl)
+    const result = await fetchOpenAIResult(openAiPayload, openaiApiKey, videoConfig, baseUrl, cacheContext)
 
     if (openAiPayload.stream) {
       res.setHeader('Content-Type', 'text/plain; charset=utf-8')
@@ -43,9 +46,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     if (error instanceof SummarizeRequestError) {
       return res.status(error.statusCode).json({ errorMessage: error.message })
     }
-    console.error(error?.message)
-    return res.status(500).json({
-      errorMessage: error?.message || 'Internal Server Error',
+    const classified = classifyUpstreamError(error)
+    console.error(`${classified.kind}: ${classified.message}`)
+    return res.status(classified.httpStatus).json({
+      errorMessage: `${classified.kind}: ${classified.message}`,
+      errorCode: classified.kind,
     })
   }
 }

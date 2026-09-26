@@ -1,6 +1,9 @@
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible'
 import { ModelMessage, generateText, streamText } from 'ai'
 import { Redis } from '@upstash/redis'
+import { classifyUpstreamError } from '~/lib/models/errors'
+import { CacheIdContext } from '~/lib/models/types'
+import { normalizeBaseUrl } from '~/lib/models/registry'
 import { trimOpenAiResult } from '~/lib/openai/trimOpenAiResult'
 import { VideoConfig } from '~/lib/types'
 import { isDev } from '~/utils/env'
@@ -29,19 +32,12 @@ export interface OpenAIStreamPayload {
   n?: number
 }
 
+// When a provider stream fails or emits nothing, retry at most once via
+// non-stream generateText; never loop or chain fallbacks further.
+const MAX_FALLBACK_ATTEMPTS = 1
+
 function resolveProviderApiKey(apiKey?: string) {
   return apiKey || process.env.OPENAI_COMPATIBLE_API_KEY || process.env.OPENAI_API_KEY || ''
-}
-
-function normalizeBaseUrl(baseUrl?: string) {
-  const value = baseUrl?.trim()
-  if (!value) {
-    return ''
-  }
-  if (!/^https?:\/\//.test(value)) {
-    throw new Error('baseUrl must start with http:// or https://')
-  }
-  return value.replace(/\/+$/, '')
 }
 
 function createProvider(apiKey: string, baseUrl?: string) {
@@ -77,29 +73,39 @@ async function generateTextFallback(params: {
   return trimOpenAiResult(result.text)
 }
 
+async function cacheCompletedResult(redis: Redis, cacheId: string, text: string) {
+  // Errors and half-finished summaries must never pollute the cache.
+  if (!text.trim()) {
+    console.warn(`skip caching empty result for ${cacheId}`)
+    return
+  }
+  const data = await redis.set(cacheId, text)
+  console.info(`video ${cacheId} cached:`, data)
+}
+
 export async function fetchOpenAIResult(
   payload: OpenAIStreamPayload,
   apiKey: string,
   videoConfig: VideoConfig,
   baseUrl?: string,
+  cacheContext?: CacheIdContext,
 ) {
   const resolvedApiKey = resolveProviderApiKey(apiKey)
   if (!resolvedApiKey) {
     throw new Error('Missing API key for OpenAI-compatible provider')
   }
-  const model = createProvider(resolvedApiKey, baseUrl).chatModel(payload.model)
+  const provider = createProvider(resolvedApiKey, baseUrl)
+  const model = provider.chatModel(payload.model)
   const messages = toModelMessages(payload.messages)
 
-  isDev && console.log({ apiKey: resolvedApiKey })
-
   const redis = Redis.fromEnv()
-  const cacheId = getCacheId(videoConfig)
+  const cacheId = getCacheId(videoConfig, cacheContext)
+  console.info(`[summarize] model=${payload.model} stream=${payload.stream} cacheId=${cacheId}`)
 
   if (!payload.stream) {
     const betterResult = await generateTextFallback({ model, messages, payload })
 
-    const data = await redis.set(cacheId, betterResult)
-    console.info(`video ${cacheId} cached:`, data)
+    await cacheCompletedResult(redis, cacheId, betterResult)
     isDev && console.log('========betterResult========', betterResult)
 
     return betterResult
@@ -117,6 +123,7 @@ export async function fetchOpenAIResult(
 
   const encoder = new TextEncoder()
   let tempData = ''
+  let fallbackAttempts = 0
   const stream = new ReadableStream({
     async start(controller) {
       try {
@@ -127,7 +134,8 @@ export async function fetchOpenAIResult(
 
         // Edge runtime can fail to decode provider stream in some environments.
         // If stream finished but emitted no usable content, fallback to non-stream.
-        if (!tempData.trim()) {
+        if (!tempData.trim() && fallbackAttempts < MAX_FALLBACK_ATTEMPTS) {
+          fallbackAttempts += 1
           const fallbackText = await generateTextFallback({ model, messages, payload })
           if (fallbackText) {
             tempData = fallbackText
@@ -136,22 +144,35 @@ export async function fetchOpenAIResult(
         }
 
         controller.close()
-        const data = await redis.set(cacheId, tempData)
-        console.info(`video ${cacheId} cached:`, data)
+        await cacheCompletedResult(redis, cacheId, tempData)
         isDev && console.log('========betterResult after streamed========', tempData)
       } catch (streamError) {
-        // Degrade gracefully: return full text instead of failing the whole request.
-        try {
-          const fallbackText = await generateTextFallback({ model, messages, payload })
-          tempData = fallbackText
-          controller.enqueue(encoder.encode(fallbackText))
-          controller.close()
-          const data = await redis.set(cacheId, tempData)
-          console.info(`video ${cacheId} cached by fallback:`, data)
-          isDev && console.warn('stream failed, used fallback generateText', streamError)
-        } catch (fallbackError) {
-          controller.error(fallbackError)
+        const classified = classifyUpstreamError(streamError)
+        console.error(`[summarize] stream failed cacheId=${cacheId} kind=${classified.kind}: ${classified.message}`)
+
+        // Only degrade to non-stream when nothing was emitted yet; appending a
+        // full retry after partial content would duplicate output.
+        if (!tempData.trim() && fallbackAttempts < MAX_FALLBACK_ATTEMPTS) {
+          fallbackAttempts += 1
+          try {
+            const fallbackText = await generateTextFallback({ model, messages, payload })
+            tempData = fallbackText
+            controller.enqueue(encoder.encode(fallbackText))
+            controller.close()
+            await cacheCompletedResult(redis, cacheId, tempData)
+            isDev && console.warn('stream failed, used fallback generateText', classified.kind)
+            return
+          } catch (fallbackError) {
+            const fallbackClassified = classifyUpstreamError(fallbackError)
+            console.error(
+              `[summarize] fallback failed cacheId=${cacheId} kind=${fallbackClassified.kind}: ${fallbackClassified.message}`,
+            )
+            controller.error(new Error(`${fallbackClassified.kind}: ${fallbackClassified.message}`))
+            return
+          }
         }
+
+        controller.error(new Error(`${classified.kind}: ${classified.message}`))
       }
     },
   })

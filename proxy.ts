@@ -2,6 +2,7 @@ import { createMiddlewareSupabaseClient } from '@supabase/auth-helpers-nextjs'
 import { Redis } from '@upstash/redis'
 import type { NextFetchEvent, NextRequest } from 'next/server'
 import { NextResponse } from 'next/server'
+import { resolveCacheIdContext } from '~/lib/models/registry'
 import { SummarizeParams } from '~/lib/types'
 import { getCacheId } from '~/utils/getCacheId'
 import { validateLicenseKey } from './lib/lemon'
@@ -73,7 +74,10 @@ export async function proxy(req: NextRequest, context: NextFetchEvent) {
       return NextResponse.next()
     }
 
-    const cacheId = getCacheId(videoConfig)
+    // Same deterministic resolution as fetchOpenAIResult so proxy reads and
+    // handler writes always land on the same cache key.
+    const cacheContext = resolveCacheIdContext({ baseUrl: userConfig.baseUrl, model: videoConfig.model })
+    const cacheId = getCacheId(videoConfig, cacheContext)
     const ipIdentifier =
       req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || req.headers.get('x-real-ip') || '127.0.0.11'
 

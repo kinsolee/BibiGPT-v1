@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "outDir": "/tmp/kin44-unit-out",
+    "declaration": false,
+    "noEmit": false,
+    "jsx": "react-jsx"
+  },
+  "include": ["utils/getCacheId.ts", "lib/models/registry.ts", "lib/models/errors.ts", "lib/models/catalog.ts"],
+  "exclude": ["node_modules", ".next"]
+}

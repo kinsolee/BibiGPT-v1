@@ -3,10 +3,15 @@ import { ChatGPTAgent, OpenAIStreamPayload } from '~/lib/openai/fetchOpenAIResul
 import { getSmallSizeTranscripts } from '~/lib/openai/getSmallSizeTranscripts'
 import { getUserSubtitlePrompt, getUserSubtitleWithTimestampPrompt } from '~/lib/openai/prompt'
 import { sourceErrorCodeToHttpStatus, SourceError } from '~/lib/sources/types'
+import {
+  isLikelyThinkingModel,
+  resolveCacheIdContext,
+  resolveModelTarget,
+  THINKING_MODEL_MIN_OUTPUT_TOKENS,
+} from '~/lib/models/registry'
+import { CacheIdContext } from '~/lib/models/types'
 import { SummarizeParams } from '~/lib/types'
 import { isDev } from '~/utils/env'
-
-const DEFAULT_MODEL = process.env.OPENAI_COMPATIBLE_MODEL || 'gpt-3.5-turbo'
 
 export class SummarizeRequestError extends Error {
   statusCode: number
@@ -22,6 +27,8 @@ export async function buildSummarizeOpenAIPayload({ videoConfig, userConfig }: S
   openAiPayload: OpenAIStreamPayload
   userKey?: string
   baseUrl?: string
+  cacheContext: CacheIdContext
+  modelTarget: ReturnType<typeof resolveModelTarget>
   videoId: string
 }> {
   const { userKey, baseUrl, shouldShowTimestamp } = userConfig || {}
@@ -57,12 +64,18 @@ export async function buildSummarizeOpenAIPayload({ videoConfig, userConfig }: S
     console.log('final user prompt: ', userPrompt)
   }
 
+  const modelTarget = resolveModelTarget({ model: videoConfig.model, baseUrl })
+  const detailTokens = Number(videoConfig.detailLevel) || (userKey ? 800 : 600)
   const openAiPayload: OpenAIStreamPayload = {
-    model: videoConfig.model || DEFAULT_MODEL,
+    model: modelTarget.model,
     messages: [{ role: ChatGPTAgent.user, content: userPrompt }],
-    max_tokens: Number(videoConfig.detailLevel) || (userKey ? 800 : 600),
+    max_tokens: isLikelyThinkingModel(modelTarget.model)
+      ? Math.max(detailTokens, THINKING_MODEL_MIN_OUTPUT_TOKENS)
+      : detailTokens,
     stream: Boolean(videoConfig.enableStream ?? true),
   }
 
-  return { openAiPayload, userKey, baseUrl, videoId }
+  const cacheContext = resolveCacheIdContext({ baseUrl, model: videoConfig.model })
+
+  return { openAiPayload, userKey, baseUrl: modelTarget.baseUrl, cacheContext, modelTarget, videoId }
 }

@@ -2,6 +2,7 @@ import type { NextApiRequest, NextApiResponse } from 'next'
 import { buildSummarizeOpenAIPayload, SummarizeRequestError } from '~/lib/openai/buildSummarizeRequest'
 import { fetchOpenAIResult } from '~/lib/openai/fetchOpenAIResult'
 import { selectApiKeyAndActivatedLicenseKey } from '~/lib/openai/selectApiKeyAndActivatedLicenseKey'
+import { classifyUpstreamError } from '~/lib/models/errors'
 import { SummarizeParams } from '~/lib/types'
 import { writeWebStreamToNodeResponse } from '~/lib/openai/writeWebStreamToNodeResponse'
 
@@ -29,9 +30,18 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   }
 
   try {
-    const { openAiPayload, userKey, baseUrl, videoId } = await buildSummarizeOpenAIPayload({ videoConfig, userConfig })
+    const { openAiPayload, userKey, baseUrl, cacheContext, videoId } = await buildSummarizeOpenAIPayload({
+      videoConfig,
+      userConfig,
+    })
     const openaiApiKey = await selectApiKeyAndActivatedLicenseKey(userKey, videoId)
-    const streamResult = await fetchOpenAIResult({ ...openAiPayload, stream: true }, openaiApiKey, videoConfig, baseUrl)
+    const streamResult = await fetchOpenAIResult(
+      { ...openAiPayload, stream: true },
+      openaiApiKey,
+      videoConfig,
+      baseUrl,
+      cacheContext,
+    )
 
     res.setHeader('Content-Type', 'text/plain; charset=utf-8')
     res.setHeader('Cache-Control', 'no-cache')
@@ -43,9 +53,14 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     res.status(200).send(streamResult)
   } catch (error: any) {
-    const statusCode = error instanceof SummarizeRequestError ? error.statusCode : 500
-    const message = error?.message || 'Internal Server Error'
-    console.error(message)
-    res.status(statusCode).send(toHttpErrorMessage(statusCode, message))
+    if (error instanceof SummarizeRequestError) {
+      console.error(error.message)
+      return res.status(error.statusCode).send(toHttpErrorMessage(error.statusCode, error.message))
+    }
+    const classified = classifyUpstreamError(error)
+    console.error(`${classified.kind}: ${classified.message}`)
+    res
+      .status(classified.httpStatus)
+      .send(toHttpErrorMessage(classified.httpStatus, `${classified.kind}: ${classified.message}`))
   }
 }
