@@ -82,6 +82,9 @@ export function buildSummaryJobDigest(input: SummaryJobInput) {
     provider: input.provider,
     baseUrl: input.baseUrl,
     promptVersion: input.promptVersion,
+    // 有效输出预算影响生成结果（detailLevel 缺省时由 userKey 推导 800/600），
+    // 不同预算不得复用彼此的 job
+    detailTokens: input.detailTokens,
     config: configSnapshot,
     chunks: input.chunks.map((chunk) => chunk.hash),
   }
@@ -310,9 +313,9 @@ export async function runSummaryToCompletion(
     const error = snapshot.record.error
     throw new JobFailureError(error?.code ?? 'JOB_NOT_SUCCEEDED', error?.message ?? 'job did not succeed', 'failed')
   }
-  if (!reused) {
-    await writeJobResultToCanonicalCache(input, snapshot.record.resultText)
-  }
+  // 复用路径也回写：首写失败或缓存被清后，后续复用请求会修复 canonical key，
+  // 避免 proxy 永远 miss（幂等 SET，fail-open）
+  await writeJobResultToCanonicalCache(input, snapshot.record.resultText)
   return {
     jobId: snapshot.record.id,
     snapshot,

@@ -59,8 +59,15 @@ export function getUtf8ByteLength(text: string) {
   return Buffer.byteLength(text, 'utf8')
 }
 
-function stableChunkHash(text: string) {
-  return createHash('sha256').update(text, 'utf8').digest('hex').slice(0, 16)
+/**
+ * chunk 身份哈希：文本 + 起止秒。时间轴会进入 chunk prompt（分段标注），
+ * 字幕 timing 修正后必须产生新 chunk/job，避免复用旧结果返回过期时间戳。
+ */
+function stableChunkHash(text: string, startSeconds: number | null, endSeconds: number | null) {
+  return createHash('sha256')
+    .update(JSON.stringify({ text, startSeconds, endSeconds }), 'utf8')
+    .digest('hex')
+    .slice(0, 16)
 }
 
 /**
@@ -144,7 +151,7 @@ export function chunkSubtitles(
     const last = atoms[firstAtomIndex + currentTexts.length - 1]
     chunks.push({
       index: chunks.length,
-      hash: stableChunkHash(text),
+      hash: stableChunkHash(text, first.seconds, last.seconds),
       text,
       byteLength: getUtf8ByteLength(text),
       startSeconds: first.seconds,

@@ -206,6 +206,9 @@ export class JobEngine {
     const runningHere = this.runningJobs.has(jobId)
     if (!runningHere && !(await this.options.store.hasJobLock(jobId).catch(() => false))) {
       await this.finalizeCanceled(snapshot)
+      // 无 worker 直接收尾时必须清共享取消标志：否则后续同 digest 重启执行
+      // 会在每个检查点命中过期标志被立即取消，job 直到 TTL 过期都不可跑
+      await this.options.store.clearCancelFlag(jobId).catch(() => undefined)
     }
     return true
   }
@@ -333,9 +336,17 @@ export class JobEngine {
   ): Promise<{ record: JobRecord; steps: JobStepRecord[] }> {
     const store = this.options.store
     const existingRecord = await store.loadJob(jobId)
-    const existingSteps = await store.loadSteps(jobId)
-    if (existingRecord && existingSteps) {
-      return { record: existingRecord, steps: existingSteps }
+    if (existingRecord) {
+      const existingSteps = await store.loadSteps(jobId)
+      if (existingSteps) {
+        return { record: existingRecord, steps: existingSteps }
+      }
+      // steps 缺失/损坏（部分写入或独立过期）：保留原记录（succeeded 结果、
+      // attempt、checkpoint、error 都不能抹掉），仅按 params 重建 queued steps
+      const rebuilt = buildSteps(existingRecord.params.chunks.length, this.stepMaxAttempts)
+      await store.saveSteps(jobId, rebuilt)
+      console.warn(`[jobs] rebuilt missing steps for ${jobId} (record preserved, status=${existingRecord.status})`)
+      return { record: existingRecord, steps: rebuilt }
     }
     const record: JobRecord = {
       id: jobId,

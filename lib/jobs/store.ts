@@ -86,6 +86,7 @@ export class MemoryJobStore implements JobStore {
     this.steps.delete(jobId)
     this.active.delete(jobId)
     this.failed.delete(jobId)
+    this.cancelFlags.delete(jobId)
   }
 
   async addActiveIndex(jobId: string, createdAtMs: number) {
@@ -196,7 +197,7 @@ class UpstashJobStore implements JobStore {
   }
 
   async deleteJob(jobId: string) {
-    await this.redis.del(this.jobKey(jobId), this.stepsKey(jobId))
+    await this.redis.del(this.jobKey(jobId), this.stepsKey(jobId), this.cancelKey(jobId))
     await this.removeActiveIndex(jobId)
     await this.removeFailedIndex(jobId)
   }
@@ -234,12 +235,13 @@ class UpstashJobStore implements JobStore {
   }
 
   async releaseJobLock(jobId: string, holderId: string) {
-    // GET+DEL 非原子，但错删窗口极小且有 TTL 兜底；自用版足够。
-    // 持有者崩溃时锁靠 TTL 自动过期，不会死锁。
-    const current = await this.redis.get<string>(this.lockKey(jobId))
-    if (current === holderId) {
-      await this.redis.del(this.lockKey(jobId))
-    }
+    // 原子 compare-and-delete：避免 GET 后 lease 过期、他实例拿锁、旧 worker 再 DEL
+    // 误删新持有者的锁
+    const script = `if redis.call("get", KEYS[1]) == ARGV[1] then
+  return redis.call("del", KEYS[1])
+end
+return 0`
+    await this.redis.eval<string[], unknown>(script, [this.lockKey(jobId)], [holderId])
   }
 
   async hasJobLock(jobId: string) {
