@@ -47,11 +47,28 @@ export function buildChunkUserPrompt(input: {
     : getUserSubtitlePrompt(annotatedTitle, chunk.text, videoConfig)
 }
 
+/** 分层 reduce 的 section 时间区间：与 chunkOutputs 一一对应；中间层 section 的区间为其覆盖的原始 chunk 的并集 */
+export interface SectionRange {
+  startSeconds: number | null
+  endSeconds: number | null
+}
+
+function formatRange(range: SectionRange) {
+  const start = formatSeconds(range.startSeconds)
+  const end = formatSeconds(range.endSeconds)
+  if (start && end) {
+    return `${start}–${end}`
+  }
+  return start ?? ''
+}
+
 /**
  * reduce 提示词：把按时间顺序的各段摘要合并成全局 summary + highlights + chapters。
  * 与 fast path 的输出模板保持同构（## Summary / ## Highlights），额外给出章节划分。
  * intermediate=true 为分层中间层：只做要点归并（无 chapters），供超长 transcript
  * 的多级 reduce 使用。
+ * sectionRanges 优先提供每个 section 的真实时间区间（分层归并后的并集）；
+ * 缺省时退回按 chunks[position] 推导（仅适用于 section 与 chunk 一一对应的最终层）。
  */
 export function buildReduceUserPrompt(input: {
   title: string | null
@@ -60,8 +77,9 @@ export function buildReduceUserPrompt(input: {
   videoConfig: VideoConfig
   shouldShowTimestamp?: boolean
   intermediate?: boolean
+  sectionRanges?: SectionRange[]
 }) {
-  const { title, chunks, chunkOutputs, videoConfig, shouldShowTimestamp, intermediate } = input
+  const { title, chunks, chunkOutputs, videoConfig, shouldShowTimestamp, intermediate, sectionRanges } = input
   const language = videoConfig.outputLanguage || DEFAULT_LANGUAGE
   const languageName = LANGUAGE_CODE_TO_ENGLISH_NAME[language] || language
   const sentenceCount = videoConfig.sentenceNumber || 7
@@ -71,9 +89,11 @@ export function buildReduceUserPrompt(input: {
 
   const sections = chunkOutputs
     .map((output, position) => {
-      // 分层 reduce 时 sections 数与 chunks 不对应（中间层归并结果），越界则省略时间范围
-      const chunk = chunks[position]
-      const range = chunk ? chunkRangeLabel(chunk) : ''
+      // 分层 reduce 时优先用传入的真实区间（合并组的并集），避免按 chunks
+      // 位置错位标注；最终层二者等价
+      const provided = sectionRanges?.[position]
+      const fallbackChunk = chunks[position]
+      const range = provided ? formatRange(provided) : fallbackChunk ? chunkRangeLabel(fallbackChunk) : ''
       const header = range
         ? `Section ${position + 1}/${chunkOutputs.length} (${range}):`
         : `Section ${position + 1}/${chunkOutputs.length}:`

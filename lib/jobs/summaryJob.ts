@@ -8,10 +8,11 @@ import { getUtf8ByteLength } from '~/lib/openai/getSmallSizeTranscripts'
 import { selectApiKeyAndActivatedLicenseKey } from '~/lib/openai/selectApiKeyAndActivatedLicenseKey'
 import type { BuiltSummarizeRequest } from '~/lib/openai/buildSummarizeRequest'
 import { ChatGPTAgent, fetchOpenAIResult, OpenAIStreamPayload } from '~/lib/openai/fetchOpenAIResult'
-import { buildChunkUserPrompt, buildReduceUserPrompt } from '~/lib/jobs/prompts'
+import { buildChunkUserPrompt, buildReduceUserPrompt, SectionRange } from '~/lib/jobs/prompts'
 import { JobEngine, JobFailureError, StepRunner } from '~/lib/jobs/engine'
 import { JobChunkSpec, JobSnapshot, SummaryJobParams } from '~/lib/jobs/types'
 import { getDefaultJobStore } from '~/lib/jobs/store'
+import { isValidSummaryText } from '~/lib/jobs/validation'
 import { UserConfig, VideoConfig } from '~/lib/types'
 
 /** 参与 job 幂等摘要的配置键：与 getCacheId/toSummaryConfigSnapshot 的口径保持一致 */
@@ -144,7 +145,12 @@ export function groupSectionsForReduce(sections: string[], maxBytes: number): st
 
 /** 生产 StepRunner：chunk/reduce 都走非流式 generateText，可整体落缓存与重试 */
 export function createOpenAIStepRunner(): StepRunner {
-  const callReduceModel = async (params: SummaryJobParams, sections: string[], intermediate: boolean) => {
+  const callReduceModel = async (
+    params: SummaryJobParams,
+    sections: string[],
+    sectionRanges: SectionRange[],
+    intermediate: boolean,
+  ) => {
     if (sections.some((output) => !output.trim())) {
       throw new JobFailureError('REDUCE_INPUT_EMPTY', 'reduce received empty chunk output', 'failed')
     }
@@ -155,6 +161,7 @@ export function createOpenAIStepRunner(): StepRunner {
       videoConfig: params.videoConfig,
       shouldShowTimestamp: params.userConfig.shouldShowTimestamp,
       intermediate,
+      sectionRanges,
     })
     const syntheticVideoConfig = { ...params.videoConfig, videoId: `${params.videoConfig.videoId}#reduce` }
     const payload: OpenAIStreamPayload = {
@@ -170,7 +177,16 @@ export function createOpenAIStepRunner(): StepRunner {
       params.baseUrl,
       resolveCacheIdContext({ baseUrl: params.baseUrl, model: params.model }),
     )
-    return typeof result === 'string' ? result : String(result)
+    const text = typeof result === 'string' ? result : String(result)
+    // 每一层（含中间层）都校验：2xx 错误页/裸 JSON 错误体混进任何一层都会污染最终摘要
+    if (!isValidSummaryText(text)) {
+      throw new JobFailureError(
+        'PROVIDER_ERROR_PAGE',
+        `provider returned empty or non-summary content at a reduce level (intermediate=${intermediate})`,
+        'failed',
+      )
+    }
+    return text
   }
 
   return {
@@ -211,11 +227,17 @@ export function createOpenAIStepRunner(): StepRunner {
      * 分层 reduce：拼接后的 section 摘要超过单请求输入上界
      * （DEFAULT_REDUCE_INPUT_BYTE_LIMIT）时，先按组做中间层归并
      * （consolidated notes），逐层收敛后再发最终 reduce。
+     * sectionRanges 随层维护——归并组的区间为其覆盖的原始 chunk 区间的并集，
+     * 中间层标注的是真实覆盖范围而非按位置的错位区间。
      * 中间层串行执行，共享本步骤的 step 超时/重试预算（层数≤8；极端
      * 不收敛时以最终 reduce 的截断语义兜底）。
      */
     async runReduce(params: SummaryJobParams, chunkOutputs: string[]): Promise<string> {
       let sections = chunkOutputs.map((output) => output.trim())
+      let ranges: SectionRange[] = params.chunks.map((chunk) => ({
+        startSeconds: chunk.startSeconds,
+        endSeconds: chunk.endSeconds,
+      }))
       let levels = 0
       while (
         sections.length > 1 &&
@@ -225,12 +247,23 @@ export function createOpenAIStepRunner(): StepRunner {
         levels += 1
         const groups = groupSectionsForReduce(sections, DEFAULT_REDUCE_INPUT_BYTE_LIMIT)
         const merged: string[] = []
+        const mergedRanges: SectionRange[] = []
+        let offset = 0
         for (const group of groups) {
-          merged.push(await callReduceModel(params, group, true))
+          // 组内各 section 沿用各自原始区间（中间层 header 标注准确）
+          const groupRanges = ranges.slice(offset, offset + group.length)
+          merged.push(await callReduceModel(params, group, groupRanges, true))
+          // 归并后的新 section 区间 = 该组覆盖区间的并集（供下一层/最终层标注）
+          mergedRanges.push({
+            startSeconds: groupRanges[0]?.startSeconds ?? null,
+            endSeconds: groupRanges[groupRanges.length - 1]?.endSeconds ?? null,
+          })
+          offset += group.length
         }
         sections = merged
+        ranges = mergedRanges
       }
-      return callReduceModel(params, sections, false)
+      return callReduceModel(params, sections, ranges, false)
     },
   }
 }

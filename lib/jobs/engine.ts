@@ -173,20 +173,52 @@ export class JobEngine {
   }
 
   async listActiveJobs(): Promise<string[]> {
-    return this.options.store.listActiveJobIds()
+    const jobIds = await this.options.store.listActiveJobIds()
+    const active: string[] = []
+    for (const jobId of jobIds) {
+      const record = await this.options.store.loadJob(jobId)
+      if (record && !isTerminalJobStatus(record.status)) {
+        active.push(jobId)
+        continue
+      }
+      // 记录已过期（7 天 TTL）或已达终态：索引条目是残留（如 worker 崩溃未清），
+      // 惰性清除，防止 listActiveJobs 永久返回死 ID 且索引无界增长
+      await this.options.store.removeActiveIndex(jobId).catch(() => undefined)
+    }
+    return active
   }
 
   async listFailedJobs(olderThanMs?: number): Promise<string[]> {
     return this.options.store.listFailedJobIds(olderThanMs)
   }
 
-  /** 失败队列清理：删除失败索引中（早于阈值的）job 记录，返回清理数量 */
+  /**
+   * 失败队列清理：逐个候选先取 job 执行锁再重读状态，只删除仍为 failed 的
+   * 记录（或记录已过期的残留）；锁被占（有实例在重跑/清理该 job）时跳过，
+   * 避免删掉正在重试的 job 的记录与 checkpoint。返回清理数量。
+   */
   async cleanupFailedJobs(olderThanMs?: number): Promise<number> {
     const jobIds = await this.options.store.listFailedJobIds(olderThanMs)
+    let removed = 0
     for (const jobId of jobIds) {
-      await this.options.store.deleteJob(jobId)
+      const holder = `cleanup:${jobId}:${Math.random().toString(36).slice(2)}`
+      if (!(await this.options.store.acquireJobLock(jobId, holder, this.lockTtlMs).catch(() => false))) {
+        continue
+      }
+      try {
+        const record = await this.options.store.loadJob(jobId)
+        if (!record || record.status === 'failed') {
+          await this.options.store.deleteJob(jobId)
+          removed += 1
+        } else {
+          // 已被重跑（running/新终态）：只清索引残留，记录留给执行者
+          await this.options.store.removeFailedIndex(jobId)
+        }
+      } finally {
+        await this.options.store.releaseJobLock(jobId, holder)
+      }
     }
-    return jobIds.length
+    return removed
   }
 
   /**
@@ -626,6 +658,11 @@ export class JobEngine {
     let attempt = 0
 
     while (attempt < maxAttempts) {
+      // backoff 等待期间可能收到取消：发起新 attempt 前先兑现，避免无谓的
+      // provider 调用并让 canceled 终态尽快落定
+      if (await this.checkCanceled(jobId)) {
+        throw new JobFailureError('CANCELED', 'job canceled by user', 'canceled')
+      }
       attempt += 1
       await commit({ status: 'running', attempt, startedAt: this.now(), error: null })
       const attemptPromise =
