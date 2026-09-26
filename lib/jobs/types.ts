@@ -48,6 +48,7 @@ export interface SummaryJobParams {
   baseUrl: string
   promptVersion: string
   detailTokens: number
+  /** 仅运行时使用：持久化进 job store 前会被剥离，续传时由当次请求重新注入 */
   apiKey: string
 }
 

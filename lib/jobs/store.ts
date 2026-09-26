@@ -38,6 +38,13 @@ export interface JobStore {
   addFailedIndex(jobId: string, updatedAtMs: number): Promise<void>
   removeFailedIndex(jobId: string): Promise<void>
   listFailedJobIds(olderThanMs?: number): Promise<string[]>
+  /**
+   * 跨实例 job 执行锁（lease）：同一 jobId 同时只允许一个持有者驱动执行。
+   * 返回 false 表示已被其它实例持有；TTL 兜底防止持有者崩溃后死锁。
+   */
+  acquireJobLock(jobId: string, holderId: string, ttlMs: number): Promise<boolean>
+  /** 只有当前持有者能释放（防误删他人锁）；非持有者调用为 no-op */
+  releaseJobLock(jobId: string, holderId: string): Promise<void>
 }
 
 /** 开发/测试用内存实现；export 以便 fixture 注入 */
@@ -46,6 +53,7 @@ export class MemoryJobStore implements JobStore {
   private steps = new Map<string, JobStepRecord[]>()
   private active = new Map<string, number>()
   private failed = new Map<string, number>()
+  private locks = new Map<string, { holderId: string; expiresAtMs: number }>()
 
   async loadJob(jobId: string) {
     return this.jobs.get(jobId) ?? null
@@ -95,6 +103,23 @@ export class MemoryJobStore implements JobStore {
       .filter(([, updatedAt]) => olderThanMs === undefined || updatedAt <= olderThanMs)
       .map(([jobId]) => jobId)
   }
+
+  async acquireJobLock(jobId: string, holderId: string, ttlMs: number) {
+    const now = Date.now()
+    const existing = this.locks.get(jobId)
+    if (existing && existing.holderId !== holderId && existing.expiresAtMs > now) {
+      return false
+    }
+    this.locks.set(jobId, { holderId, expiresAtMs: now + ttlMs })
+    return true
+  }
+
+  async releaseJobLock(jobId: string, holderId: string) {
+    const existing = this.locks.get(jobId)
+    if (existing?.holderId === holderId) {
+      this.locks.delete(jobId)
+    }
+  }
 }
 
 class UpstashJobStore implements JobStore {
@@ -110,6 +135,10 @@ class UpstashJobStore implements JobStore {
 
   private stepsKey(jobId: string) {
     return `${KEY_PREFIX}:steps:${jobId}`
+  }
+
+  private lockKey(jobId: string) {
+    return `${KEY_PREFIX}:lock:${jobId}`
   }
 
   async loadJob(jobId: string): Promise<JobRecord | null> {
@@ -161,6 +190,20 @@ class UpstashJobStore implements JobStore {
       return (await this.redis.zrange(`${KEY_PREFIX}:index:failed`, 0, -1)) as string[]
     }
     return (await this.redis.zrange(`${KEY_PREFIX}:index:failed`, 0, olderThanMs, { byScore: true })) as string[]
+  }
+
+  async acquireJobLock(jobId: string, holderId: string, ttlMs: number) {
+    const result = await this.redis.set(this.lockKey(jobId), holderId, { nx: true, px: ttlMs })
+    return result === 'OK'
+  }
+
+  async releaseJobLock(jobId: string, holderId: string) {
+    // GET+DEL 非原子，但错删窗口极小且有 TTL 兜底；自用版足够。
+    // 持有者崩溃时锁靠 TTL 自动过期，不会死锁。
+    const current = await this.redis.get<string>(this.lockKey(jobId))
+    if (current === holderId) {
+      await this.redis.del(this.lockKey(jobId))
+    }
   }
 }
 

@@ -7,6 +7,11 @@ export const DEFAULT_STEP_CONCURRENCY = Number(process.env.BIBI_JOB_STEP_CONCURR
 export const DEFAULT_STEP_TIMEOUT_MS = Number(process.env.BIBI_JOB_STEP_TIMEOUT_MS) || 300_000
 export const DEFAULT_STEP_MAX_ATTEMPTS = Number(process.env.BIBI_JOB_STEP_MAX_ATTEMPTS) || 2
 export const DEFAULT_STEP_BACKOFF_MS = Number(process.env.BIBI_JOB_STEP_BACKOFF_MS) || 2_500
+/** 分布式锁 lease：需覆盖最长一次 job 执行；持有者崩溃时靠 TTL 自动过期 */
+export const DEFAULT_JOB_LOCK_TTL_MS = Number(process.env.BIBI_JOB_LOCK_TTL_MS) || 30 * 60_000
+/** 等锁上限：另一实例在跑同一 job 时，先等它完成以便直接复用结果 */
+export const DEFAULT_JOB_LOCK_WAIT_MS = Number(process.env.BIBI_JOB_LOCK_WAIT_MS) || 90_000
+const JOB_LOCK_RETRY_INTERVAL_MS = 1_000
 
 /** 重试大概率无效的上游错误码：直接判死，不再消耗 attempt */
 const NON_RETRYABLE_KINDS = new Set(['UPSTREAM_AUTH', 'MODEL_NOT_FOUND', 'CAPABILITY_UNSUPPORTED'])
@@ -25,6 +30,9 @@ export interface JobEngineOptions {
   stepTimeoutMs?: number
   stepMaxAttempts?: number
   stepBackoffMs?: number
+  lockTtlMs?: number
+  lockWaitMs?: number
+  lockRetryIntervalMs?: number
   now?: () => number
   sleep?: (ms: number) => Promise<void>
 }
@@ -51,6 +59,11 @@ export function toJobError(error: unknown, stepIndex: number): JobError {
   }
   const classified = classifyUpstreamError(error)
   return { code: classified.kind, message: classified.message, stepIndex }
+}
+
+/** 持久化前剥离 provider API key：job record 会明文进 Redis（7 天 TTL），密钥绝不能落盘 */
+function stripApiKey(params: SummaryJobParams): SummaryJobParams {
+  return { ...params, apiKey: '' }
 }
 
 function buildSteps(chunkCount: number, maxAttempts: number): JobStepRecord[] {
@@ -105,6 +118,9 @@ export class JobEngine {
   private readonly stepTimeoutMs: number
   private readonly stepMaxAttempts: number
   private readonly stepBackoffMs: number
+  private readonly lockTtlMs: number
+  private readonly lockWaitMs: number
+  private readonly lockRetryIntervalMs: number
   private readonly now: () => number
   private readonly sleep: (ms: number) => Promise<void>
   private readonly jobLocks = createKeyedMutex()
@@ -120,6 +136,9 @@ export class JobEngine {
     this.stepTimeoutMs = Math.max(1, options.stepTimeoutMs ?? DEFAULT_STEP_TIMEOUT_MS)
     this.stepMaxAttempts = Math.max(1, options.stepMaxAttempts ?? DEFAULT_STEP_MAX_ATTEMPTS)
     this.stepBackoffMs = Math.max(0, options.stepBackoffMs ?? DEFAULT_STEP_BACKOFF_MS)
+    this.lockTtlMs = Math.max(1, options.lockTtlMs ?? DEFAULT_JOB_LOCK_TTL_MS)
+    this.lockWaitMs = Math.max(0, options.lockWaitMs ?? DEFAULT_JOB_LOCK_WAIT_MS)
+    this.lockRetryIntervalMs = Math.max(1, options.lockRetryIntervalMs ?? JOB_LOCK_RETRY_INTERVAL_MS)
     this.now = options.now ?? (() => Date.now())
     this.sleep = options.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)))
   }
@@ -210,7 +229,8 @@ export class JobEngine {
         checkpoint: [],
         error: null,
         resultText: null,
-        params,
+        // apiKey 只随运行时参数传递，持久化记录一律剥离
+        params: stripApiKey(params),
       }
       steps = buildSteps(params.chunks.length, this.stepMaxAttempts)
       await store.saveJob(record)
@@ -223,13 +243,47 @@ export class JobEngine {
       return { snapshot: { record, steps }, reused: true }
     }
 
+    // 跨实例执行锁：拿到之前绝不修改 job 状态（拿不到锁时抛错不影响既有记录）
+    const holderId = `${jobId}:${Math.random().toString(36).slice(2)}:${this.now()}`
+    const lockOutcome = await this.acquireJobLockWithWait(jobId, holderId, forceNewResult)
+    if (lockOutcome === 'completed') {
+      // 等待期间另一实例已跑完：直接复用其结果
+      const completedRecord = await store.loadJob(jobId)
+      const completedSteps = (await store.loadSteps(jobId)) ?? []
+      if (completedRecord) {
+        return { snapshot: { record: completedRecord, steps: completedSteps }, reused: true }
+      }
+    }
+    if (lockOutcome !== 'acquired') {
+      throw new JobFailureError('JOB_LOCK_BUSY', `another instance is running job ${jobId}`, 'failed')
+    }
+
+    // 强制重新生成：清空全部已完成步骤与结果，回到全量重跑（在持锁后落盘）
+    if (forceNewResult) {
+      steps = buildSteps(params.chunks.length, this.stepMaxAttempts)
+      record = {
+        ...record,
+        status: 'queued',
+        resultText: null,
+        checkpoint: [],
+        error: null,
+        updatedAt: this.now(),
+      }
+      await store.saveSteps(jobId, steps)
+      await store.saveJob(record)
+    }
+
+    // 运行时参数：持久化 params（无 key）+ 本次请求带来的 key
+    const runParams: SummaryJobParams = { ...record.params, apiKey: params.apiKey }
+
     this.canceledJobs.delete(jobId)
     this.runningJobs.add(jobId)
     try {
-      await this.executeJob(jobId, record, steps)
+      await this.executeJob(jobId, record, steps, runParams)
     } finally {
       this.runningJobs.delete(jobId)
       this.canceledJobs.delete(jobId)
+      await store.releaseJobLock(jobId, holderId)
     }
 
     const finalRecord = await store.loadJob(jobId)
@@ -240,9 +294,42 @@ export class JobEngine {
     return { snapshot: { record: finalRecord, steps: finalSteps }, reused: false }
   }
 
-  private async executeJob(jobId: string, record: JobRecord, existingSteps: JobStepRecord[]) {
+  /**
+   * 拿锁（带等待）：另一实例在跑同一 job 时先等它完成。
+   * - acquired：获得执行权
+   * - completed：等待期间 job 已被跑成 succeeded，调用方可直接复用
+   * - busy：等到上限仍未获得（调用方抛 JOB_LOCK_BUSY）
+   */
+  private async acquireJobLockWithWait(
+    jobId: string,
+    holderId: string,
+    forceNewResult: boolean,
+  ): Promise<'acquired' | 'completed' | 'busy'> {
+    const deadline = this.now() + this.lockWaitMs
+    while (true) {
+      if (await this.options.store.acquireJobLock(jobId, holderId, this.lockTtlMs)) {
+        return 'acquired'
+      }
+      if (this.now() >= deadline) {
+        return 'busy'
+      }
+      await this.sleep(this.lockRetryIntervalMs)
+      if (!forceNewResult) {
+        const record = await this.options.store.loadJob(jobId)
+        if (record?.status === 'succeeded' && record.resultText) {
+          return 'completed'
+        }
+      }
+    }
+  }
+
+  private async executeJob(
+    jobId: string,
+    record: JobRecord,
+    existingSteps: JobStepRecord[],
+    runParams: SummaryJobParams,
+  ) {
     const store = this.options.store
-    const params = record.params
 
     const chunkSteps = existingSteps.filter((step) => step.kind === 'chunk')
     const resumedChunkCount = chunkSteps.filter((step) => step.status === 'succeeded' && step.output).length
@@ -304,7 +391,7 @@ export class JobEngine {
         const stepIndex = pendingIndexes[claimed]
         const step = steps.find((candidate) => candidate.index === stepIndex)!
         try {
-          await this.runStepWithRetries(jobId, step, params, async (patch) => {
+          await this.runStepWithRetries(jobId, step, runParams, async (patch) => {
             await persistStep(step.index, patch)
             if (patch.status === 'succeeded') {
               await persistJob()
@@ -341,7 +428,7 @@ export class JobEngine {
         await this.runStepWithRetries(
           jobId,
           reduceStep,
-          params,
+          runParams,
           async (patch) => {
             await persistStep(reduceStep.index, patch)
           },
@@ -353,6 +440,15 @@ export class JobEngine {
         await this.finalizeFailed(jobId, jobError)
         throw new JobFailureError(jobError.code, jobError.message, 'failed')
       }
+    }
+
+    // reduce 完成/复用后、写入 succeeded 终态前，最后一次兑现取消请求
+    if (this.canceledJobs.has(jobId)) {
+      const snapshot = await this.getJob(jobId)
+      if (snapshot) {
+        await this.finalizeCanceled(snapshot)
+      }
+      throw new JobFailureError('CANCELED', 'job canceled by user', 'canceled')
     }
 
     const done: JobRecord = {
@@ -372,8 +468,9 @@ export class JobEngine {
 
   /**
    * 单步骤执行：attempt 循环 + 超时 + 退避；非重试型错误立即失败。
-   * fetchOpenAIResult 不支持注入 abortSignal，超时后该次 provider 调用被放弃
-   * 不再等待（结果忽略、缓存写入幂等无害）；在途请求数受并发上限约束。
+   * fetchOpenAIResult 不支持注入 abortSignal，无法真正中止超时的 provider
+   * 调用；因此超时后必须等该次 attempt settle 才能进入重试，否则反复超时下
+   * 实际在途请求数会突破并发上限（孤儿结果被忽略，缓存写入幂等无害）。
    */
   private async runStepWithRetries(
     jobId: string,
@@ -389,12 +486,12 @@ export class JobEngine {
     while (attempt < maxAttempts) {
       attempt += 1
       await commit({ status: 'running', attempt, startedAt: this.now(), error: null })
+      const attemptPromise =
+        step.kind === 'chunk'
+          ? this.options.runner.runChunk(params, step.chunkIndex!)
+          : this.options.runner.runReduce(params, chunkOutputs ?? [])
       try {
-        const promise =
-          step.kind === 'chunk'
-            ? this.options.runner.runChunk(params, step.chunkIndex!)
-            : this.options.runner.runReduce(params, chunkOutputs ?? [])
-        const raw = await this.withTimeout(promise)
+        const raw = await this.withTimeout(attemptPromise)
         const text = typeof raw === 'string' ? raw.trim() : ''
         if (!isValidSummaryText(text)) {
           throw new JobFailureError(
@@ -406,6 +503,11 @@ export class JobEngine {
         await commit({ status: 'succeeded', output: text, finishedAt: this.now(), error: null })
         return
       } catch (error) {
+        // 超时只是放弃等待，provider 调用仍在途：等它结束（结果丢弃）再判定/重试，
+        // 否则下一个 attempt 立即起跑会让实际并发超过 concurrency 上限
+        if (error instanceof StepTimeoutError) {
+          await attemptPromise.catch(() => undefined)
+        }
         const jobError = toJobError(error, step.index)
         const classified = classifyUpstreamError(error)
         const retryable =
