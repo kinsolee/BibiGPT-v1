@@ -17,6 +17,10 @@ export interface CacheIdContext {
   provider: string
   promptVersion: string
   model?: string
+  /** Prompt template generation; changes when lib/openai/prompt.ts templates change. */
+  templateVersion?: string
+  /** Short hash of the transcript/description input; absent means the caller could not provide it. */
+  transcriptHash?: string
 }
 
 export interface ResolvedModelTarget {
