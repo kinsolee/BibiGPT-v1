@@ -5,6 +5,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "verify:adapters": "node --import ./lib/sources/__fixtures__/register.mjs ./lib/sources/__fixtures__/run.mjs",
     "prepare": "husky install"
   },
   "lint-staged": {

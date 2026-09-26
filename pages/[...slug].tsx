@@ -1,5 +1,4 @@
 import { zodResolver } from '@hookform/resolvers/zod'
-import getVideoId from 'get-video-id'
 import type { NextPage } from 'next'
 import { useRouter } from 'next/router'
 import React, { useEffect, useMemo, useState } from 'react'
@@ -18,8 +17,8 @@ import { useToast } from '~/hooks/use-toast'
 import { useLocalStorage } from '~/hooks/useLocalStorage'
 import { useSummarize } from '~/hooks/useSummarize'
 import { VideoService } from '~/lib/types'
+import { findSourceAdapter, parseVideoSourceUrl } from '~/lib/sources/registry'
 import { DEFAULT_LANGUAGE } from '~/utils/constants/language'
-import { extractPage, extractUrl } from '~/utils/extractUrl'
 import { getVideoIdFromUrl } from '~/utils/getVideoIdFromUrl'
 import { VideoConfigSchema, videoConfigSchema } from '~/utils/schemas/video'
 
@@ -120,16 +119,9 @@ export const Home: NextPage<{
   }, [router.isReady, urlState, searchParams])
 
   const validateUrlFromAddressBar = (url?: string) => {
-    // note: auto refactor by ChatGPT
+    // 白名单 registry 校验：只接受 youtube/bilibili 支持域名，拒绝任意其它域名（防 SSRF）
     const videoUrl = url || currentVideoUrl
-    if (
-      // https://www.bilibili.com/video/BV1AL4y1j7RY
-      // https://www.bilibili.com/video/BV1854y1u7B8/?p=6
-      // https://www.bilibili.com/video/av352747000
-      // todo: b23.tv url with title
-      // todo: any article url
-      !(videoUrl.includes('bilibili.com/video') || videoUrl.includes('youtube.com'))
-    ) {
+    if (!findSourceAdapter(videoUrl)) {
       toast({
         title: '暂不支持此视频链接',
         description: '请输入哔哩哔哩或YouTub视频链接，已支持b23.tv短链接',
@@ -154,30 +146,24 @@ export const Home: NextPage<{
     validateUrlFromAddressBar(url)
 
     const videoUrl = url || currentVideoUrl
-    const { id, service } = getVideoId(videoUrl)
-    if (service === VideoService.Youtube && id) {
-      setCurrentVideoId(id)
-      await summarize(
-        { videoId: id, service: VideoService.Youtube, ...formValues },
-        { userKey, baseUrl: userBaseUrl, shouldShowTimestamp: shouldShowTimestamp },
-      )
+    const parsed = parseVideoSourceUrl(videoUrl)
+    if (!parsed) {
       return
     }
+    // slug 导航流（如 /video/BV…?p=6）的分 P 号在页面级 searchParams，重建 URL 里不带 query
+    const pageNumber = parsed.pageNumber || (parsed.adapter.id === 'bilibili' ? searchParams.get('p') || null : null)
+    const service = parsed.adapter.id === VideoService.Youtube ? VideoService.Youtube : VideoService.Bilibili
 
-    const videoId = extractUrl(videoUrl)
-    if (!videoId) {
-      return
-    }
-
-    const pageNumber = extractPage(currentVideoUrl, searchParams)
-    setCurrentVideoId(videoId)
+    setCurrentVideoId(parsed.videoId)
     await summarize(
-      { service: VideoService.Bilibili, videoId, pageNumber, ...formValues },
+      { videoId: parsed.videoId, service, pageNumber, ...formValues },
       { userKey, baseUrl: userBaseUrl, shouldShowTimestamp },
     )
-    setTimeout(() => {
-      window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' })
-    }, 10)
+    if (service !== VideoService.Youtube) {
+      setTimeout(() => {
+        window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' })
+      }, 10)
+    }
   }
   const onFormSubmit: SubmitHandler<VideoConfigSchema> = async (data) => {
     // e.preventDefault();
