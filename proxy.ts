@@ -3,12 +3,7 @@ import { Redis } from '@upstash/redis'
 import type { NextFetchEvent, NextRequest } from 'next/server'
 import { NextResponse } from 'next/server'
 import { persistCachedSummary } from '~/lib/history/persistCachedSummary'
-import { recordSummaryEvent } from '~/lib/observability/metrics'
-import {
-  buildSummaryCacheEnvelope,
-  readValidatedSummary,
-  writeSummaryCacheEntry,
-} from '~/lib/observability/summaryCache'
+import { readValidatedSummary } from '~/lib/observability/summaryCache'
 import { resolveCacheIdContext } from '~/lib/models/registry'
 import { SummarizeParams } from '~/lib/types'
 import { getCacheId, getCacheReadIdCandidates } from '~/utils/getCacheId'
@@ -152,19 +147,9 @@ export async function proxy(req: NextRequest, context: NextFetchEvent) {
     })
     if (lookup.kind === 'hit' || lookup.kind === 'legacy-hit') {
       const result = lookup.text
-      if (lookup.kind === 'legacy-hit') {
-        // Migrate still-valid legacy entries to the envelope format under the
-        // new key in the background so the fast path converges on its own.
-        context.waitUntil(
-          writeSummaryCacheEntry(
-            redis,
-            cacheId,
-            buildSummaryCacheEnvelope({ text: result, context: cacheContext, model: videoConfig.model }),
-          )
-            .then((migrated) => migrated && recordSummaryEvent({ event: 'cache-migration-write', cacheId }))
-            .catch(() => undefined),
-        )
-      }
+      // Served as-is: the middleware cannot know the transcript hash, so it
+      // only reaches entries written before transcript hashing (TTL-bounded).
+      // Nothing is ever written back — a version bump stays an invalidation.
       if (isChatRequest(req)) {
         const cachedResponse = new NextResponse(result, {
           status: 200,

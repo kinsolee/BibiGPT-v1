@@ -6,11 +6,12 @@ import { recordSummaryEvent } from '~/lib/observability/metrics'
  * Cache-aside primitives shared by the middleware fast path (proxy.ts) and the
  * handler path (fetchOpenAIResult.ts).
  *
- * New entries are stored as a versioned envelope with an explicit status so a
- * hit can be schema-validated before it is served. Legacy entries (plain text
- * under the pre-KIN-40 key format) stay readable for the migration window.
- * Provider HTML error pages, empty results and half-finished text are never
- * cached and get purged when found.
+ * Entries are stored as a versioned envelope with an explicit status so a hit
+ * can be schema-validated before it is served. Provider HTML error pages,
+ * empty results and half-finished text are never cached and get purged when
+ * found. Pre-version keys (summary-v2 and older) are deliberately never read:
+ * a version bump is the invalidation boundary, so old entries are left to
+ * expire on their own instead of being migrated forward.
  */
 export const CACHE_ENVELOPE_VERSION = 2
 export const DEFAULT_SUMMARY_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60
@@ -95,7 +96,7 @@ export function buildSummaryCacheEnvelope(params: {
     provider: context?.provider,
     model: model || context?.model,
     templateVersion: context?.templateVersion,
-    transcriptHash: transcriptHash ?? null,
+    transcriptHash: transcriptHash ?? context?.transcriptHash ?? null,
     cachedAt: new Date().toISOString(),
   }
 }
@@ -127,7 +128,9 @@ export async function writeSummaryCacheEntry(redis: Redis, cacheId: string, enve
 
 /**
  * Read candidates in order and validate every hit before serving. Invalid
- * entries are purged so a poisoned value cannot keep getting served.
+ * entries are purged so a poisoned value cannot keep getting served. A Redis
+ * read failure fails open to "miss": cache outages degrade to no cache and
+ * never break summarization (mirrors the write path's error handling).
  */
 export async function readValidatedSummary(
   redis: Redis,
@@ -142,7 +145,14 @@ export async function readValidatedSummary(
 
   for (let index = 0; index < candidates.length; index += 1) {
     const candidateId = candidates[index]
-    const raw = await redis.get<unknown>(candidateId)
+    let raw: unknown
+    try {
+      raw = await redis.get<unknown>(candidateId)
+    } catch (readError) {
+      console.warn(`[summary-cache] read failed for ${candidateId}: ${readError}`)
+      recordSummaryEvent({ event: 'cache-read-failed', cacheId: candidateId, origin })
+      return { kind: 'miss' }
+    }
     if (raw === null || raw === undefined) {
       continue
     }

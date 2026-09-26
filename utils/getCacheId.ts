@@ -5,7 +5,6 @@ import { CacheIdContext } from '~/lib/models/types'
 import { SUMMARY_CONFIG_VERSION, SUMMARY_TEMPLATE_VERSION } from '~/lib/models/registry'
 
 const UNHASHED_TRANSCRIPT_TOKEN = 'unhashed'
-const LEGACY_PROMPT_VERSION = 'summary-v2'
 
 function normalizeModelId(model?: string) {
   return (model || 'default').replace(/[^\w.-]/g, '_')
@@ -46,32 +45,23 @@ export function getCacheId(videoConfig: VideoConfig, context?: CacheIdContext) {
   return parts.join('-')
 }
 
-/**
- * Pre-KIN-40 key format (config dimensions only, no template/transcript part).
- * Kept solely so recently written entries stay readable during the migration
- * window; new writes never use it.
- */
-export function getLegacyCacheId(videoConfig: VideoConfig, context?: CacheIdContext) {
-  return [LEGACY_PROMPT_VERSION, ...configParts(videoConfig, context)].join('-')
-}
-
 function withTranscriptHash(cacheId: string, transcriptHash: string) {
   return cacheId.replace(/-tx-[A-Za-z0-9_]+$/, `-tx-${transcriptHash}`)
 }
 
 /**
- * Ordered read candidates for cache-aside lookups: the full key first, then
- * progressively older formats so entries written before a dimension existed
- * still hit. `getCacheId` itself stays the single write key.
+ * Ordered read candidates for cache-aside lookups: the transcript-hashed key
+ * first, then the pre-transcript-hashing key of the SAME version so entries
+ * written before that dimension existed keep hitting until their TTL lapses.
+ * Pre-version keys (summary-v2 and older) are deliberately excluded — a
+ * version bump is the invalidation boundary and old entries are never read or
+ * migrated forward.
  */
 export function getCacheReadIdCandidates(videoConfig: VideoConfig, context?: CacheIdContext): string[] {
   const primary = getCacheId(videoConfig, context)
-  const candidates = [primary]
 
-  if (context?.transcriptHash) {
-    candidates.push(withTranscriptHash(primary, UNHASHED_TRANSCRIPT_TOKEN))
+  if (!context?.transcriptHash) {
+    return [primary]
   }
-  candidates.push(getLegacyCacheId(videoConfig, context))
-
-  return candidates
+  return [primary, withTranscriptHash(primary, UNHASHED_TRANSCRIPT_TOKEN)]
 }

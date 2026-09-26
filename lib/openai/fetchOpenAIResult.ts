@@ -3,7 +3,7 @@ import { ModelMessage, generateText, streamText } from 'ai'
 import { Redis } from '@upstash/redis'
 import { classifyUpstreamError } from '~/lib/models/errors'
 import { CacheIdContext } from '~/lib/models/types'
-import { normalizeBaseUrl } from '~/lib/models/registry'
+import { normalizeBaseUrl, resolveCacheIdContext } from '~/lib/models/registry'
 import {
   buildSummaryCacheEnvelope,
   hashTranscriptInput,
@@ -110,52 +110,54 @@ export async function fetchOpenAIResult(
     throw new Error('Missing API key for OpenAI-compatible provider')
   }
 
-  const redis = Redis.fromEnv()
-  const cacheId = getCacheId(videoConfig, cacheContext)
-  const readCandidates = getCacheReadIdCandidates(videoConfig, cacheContext)
+  // Cache is strictly best-effort: a Redis outage degrades to "no cache" and
+  // must never fail summarization (same contract as the write path).
+  let redis: Redis | null = null
+  try {
+    redis = Redis.fromEnv()
+  } catch (initError) {
+    console.warn('[summary-cache] redis unavailable, serving without cache:', initError)
+  }
+
+  // Transcript identity enters the key BEFORE the lookup: payload.messages
+  // carry the full provider input (title + transcript + template), so a
+  // changed transcript rotates the key instead of serving a stale summary.
+  const transcriptHash = await hashTranscriptInput(JSON.stringify(payload.messages))
+  const effectiveContext: CacheIdContext = {
+    ...(cacheContext ?? resolveCacheIdContext()),
+    transcriptHash: cacheContext?.transcriptHash ?? transcriptHash,
+  }
+  const cacheId = getCacheId(videoConfig, effectiveContext)
+  const readCandidates = getCacheReadIdCandidates(videoConfig, effectiveContext)
   const eventBase = {
     cacheId,
     // Hashed registry token only; raw base URLs and keys never enter metrics.
-    provider: cacheContext?.provider,
+    provider: effectiveContext.provider,
     model: payload.model,
     origin: 'handler' as const,
   }
 
-  const lookup = await readValidatedSummary(redis, {
-    cacheId,
-    fallbackIds: readCandidates.slice(1),
-    origin: 'handler',
-  })
-  if (lookup.kind === 'hit' || lookup.kind === 'legacy-hit') {
-    if (lookup.kind === 'legacy-hit') {
-      // Migrate the still-valid legacy entry to the envelope format under the
-      // new key so the migration window converges on its own.
-      const transcriptHash = await hashTranscriptInput(JSON.stringify(payload.messages))
-      const migrated = await writeSummaryCacheEntry(
-        redis,
+  const lookup = redis
+    ? await readValidatedSummary(redis, {
         cacheId,
-        buildSummaryCacheEnvelope({ text: lookup.text, context: cacheContext, model: payload.model, transcriptHash }),
-      )
-      if (migrated) {
-        recordSummaryEvent({ ...eventBase, event: 'cache-migration-write' })
-      }
-    }
+        fallbackIds: readCandidates.slice(1),
+        origin: 'handler',
+      })
+    : ({ kind: 'miss' } as const)
+  if (lookup.kind === 'hit' || lookup.kind === 'legacy-hit') {
     return lookup.text
   }
 
   const provider = createProvider(resolvedApiKey, baseUrl)
   const model = provider.chatModel(payload.model)
   const messages = toModelMessages(payload.messages)
-  const transcriptHash = await hashTranscriptInput(JSON.stringify(messages))
   const startedAt = Date.now()
 
   if (!payload.stream) {
     const { text, usage } = await generateTextFallback({ model, messages, payload })
-    await writeSummaryCacheEntry(
-      redis,
-      cacheId,
-      buildSummaryCacheEnvelope({ text, context: cacheContext, model: payload.model, transcriptHash }),
-    )
+    if (redis) {
+      await writeSummaryCacheEntry(redis, cacheId, buildSummaryCacheEnvelope({ text, context: effectiveContext }))
+    }
     recordSummaryEvent({ ...eventBase, event: 'summarize-success', latencyMs: Date.now() - startedAt, ...usage })
     return text
   }
@@ -199,11 +201,13 @@ export async function fetchOpenAIResult(
         }
 
         controller.close()
-        await writeSummaryCacheEntry(
-          redis,
-          cacheId,
-          buildSummaryCacheEnvelope({ text: tempData, context: cacheContext, model: payload.model, transcriptHash }),
-        )
+        if (redis) {
+          await writeSummaryCacheEntry(
+            redis,
+            cacheId,
+            buildSummaryCacheEnvelope({ text: tempData, context: effectiveContext, model: payload.model }),
+          )
+        }
         recordSummaryEvent({
           ...eventBase,
           event: 'summarize-success',
@@ -224,16 +228,13 @@ export async function fetchOpenAIResult(
             tempData = fallback.text
             controller.enqueue(encoder.encode(fallback.text))
             controller.close()
-            await writeSummaryCacheEntry(
-              redis,
-              cacheId,
-              buildSummaryCacheEnvelope({
-                text: tempData,
-                context: cacheContext,
-                model: payload.model,
-                transcriptHash,
-              }),
-            )
+            if (redis) {
+              await writeSummaryCacheEntry(
+                redis,
+                cacheId,
+                buildSummaryCacheEnvelope({ text: tempData, context: effectiveContext, model: payload.model }),
+              )
+            }
             recordSummaryEvent({
               ...eventBase,
               event: 'summarize-success',
