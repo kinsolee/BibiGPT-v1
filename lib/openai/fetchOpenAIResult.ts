@@ -3,11 +3,17 @@ import { ModelMessage, generateText, streamText } from 'ai'
 import { Redis } from '@upstash/redis'
 import { classifyUpstreamError } from '~/lib/models/errors'
 import { CacheIdContext } from '~/lib/models/types'
-import { normalizeBaseUrl } from '~/lib/models/registry'
+import { normalizeBaseUrl, resolveCacheIdContext } from '~/lib/models/registry'
+import {
+  buildSummaryCacheEnvelope,
+  hashTranscriptInput,
+  readValidatedSummary,
+  writeSummaryCacheEntry,
+} from '~/lib/observability/summaryCache'
+import { recordSummaryEvent } from '~/lib/observability/metrics'
 import { trimOpenAiResult } from '~/lib/openai/trimOpenAiResult'
 import { VideoConfig } from '~/lib/types'
-import { isDev } from '~/utils/env'
-import { getCacheId } from '~/utils/getCacheId'
+import { getCacheId, getCacheReadIdCandidates } from '~/utils/getCacheId'
 
 export enum ChatGPTAgent {
   user = 'user',
@@ -55,11 +61,30 @@ function toModelMessages(messages: ChatGPTMessage[]): ModelMessage[] {
   })) as ModelMessage[]
 }
 
+interface TokenUsage {
+  inputTokens: number
+  outputTokens: number
+}
+
+function toTokenUsage(usage: unknown): TokenUsage {
+  const parsed = usage as { inputTokens?: unknown; outputTokens?: unknown } | null | undefined
+  const toNumber = (value: unknown) => (typeof value === 'number' && Number.isFinite(value) ? value : 0)
+  return { inputTokens: toNumber(parsed?.inputTokens), outputTokens: toNumber(parsed?.outputTokens) }
+}
+
+async function readStreamUsage(usage: PromiseLike<unknown>): Promise<TokenUsage> {
+  try {
+    return toTokenUsage(await usage)
+  } catch {
+    return { inputTokens: 0, outputTokens: 0 }
+  }
+}
+
 async function generateTextFallback(params: {
   model: ReturnType<ReturnType<typeof createProvider>['chatModel']>
   messages: ModelMessage[]
   payload: OpenAIStreamPayload
-}) {
+}): Promise<{ text: string; usage: TokenUsage }> {
   const result = await generateText({
     model: params.model,
     messages: params.messages,
@@ -70,17 +95,7 @@ async function generateTextFallback(params: {
     presencePenalty: params.payload.presence_penalty,
   })
 
-  return trimOpenAiResult(result.text)
-}
-
-async function cacheCompletedResult(redis: Redis, cacheId: string, text: string) {
-  // Errors and half-finished summaries must never pollute the cache.
-  if (!text.trim()) {
-    console.warn(`skip caching empty result for ${cacheId}`)
-    return
-  }
-  const data = await redis.set(cacheId, text)
-  console.info(`video ${cacheId} cached:`, data)
+  return { text: trimOpenAiResult(result.text), usage: toTokenUsage(result.usage) }
 }
 
 export async function fetchOpenAIResult(
@@ -94,21 +109,57 @@ export async function fetchOpenAIResult(
   if (!resolvedApiKey) {
     throw new Error('Missing API key for OpenAI-compatible provider')
   }
+
+  // Cache is strictly best-effort: a Redis outage degrades to "no cache" and
+  // must never fail summarization (same contract as the write path).
+  let redis: Redis | null = null
+  try {
+    redis = Redis.fromEnv()
+  } catch (initError) {
+    console.warn('[summary-cache] redis unavailable, serving without cache:', initError)
+  }
+
+  // Transcript identity enters the key BEFORE the lookup: payload.messages
+  // carry the full provider input (title + transcript + template), so a
+  // changed transcript rotates the key instead of serving a stale summary.
+  const transcriptHash = await hashTranscriptInput(JSON.stringify(payload.messages))
+  const effectiveContext: CacheIdContext = {
+    ...(cacheContext ?? resolveCacheIdContext()),
+    transcriptHash: cacheContext?.transcriptHash ?? transcriptHash,
+  }
+  const cacheId = getCacheId(videoConfig, effectiveContext)
+  const readCandidates = getCacheReadIdCandidates(videoConfig, effectiveContext)
+  const eventBase = {
+    cacheId,
+    // Hashed registry token only; raw base URLs and keys never enter metrics.
+    provider: effectiveContext.provider,
+    model: payload.model,
+    origin: 'handler' as const,
+  }
+
+  const lookup = redis
+    ? await readValidatedSummary(redis, {
+        cacheId,
+        fallbackIds: readCandidates.slice(1),
+        origin: 'handler',
+      })
+    : ({ kind: 'miss' } as const)
+  if (lookup.kind === 'hit' || lookup.kind === 'legacy-hit') {
+    return lookup.text
+  }
+
   const provider = createProvider(resolvedApiKey, baseUrl)
   const model = provider.chatModel(payload.model)
   const messages = toModelMessages(payload.messages)
-
-  const redis = Redis.fromEnv()
-  const cacheId = getCacheId(videoConfig, cacheContext)
-  console.info(`[summarize] model=${payload.model} stream=${payload.stream} cacheId=${cacheId}`)
+  const startedAt = Date.now()
 
   if (!payload.stream) {
-    const betterResult = await generateTextFallback({ model, messages, payload })
-
-    await cacheCompletedResult(redis, cacheId, betterResult)
-    isDev && console.log('========betterResult========', betterResult)
-
-    return betterResult
+    const { text, usage } = await generateTextFallback({ model, messages, payload })
+    if (redis) {
+      await writeSummaryCacheEntry(redis, cacheId, buildSummaryCacheEnvelope({ text, context: effectiveContext }))
+    }
+    recordSummaryEvent({ ...eventBase, event: 'summarize-success', latencyMs: Date.now() - startedAt, ...usage })
+    return text
   }
 
   const result = streamText({
@@ -124,54 +175,93 @@ export async function fetchOpenAIResult(
   const encoder = new TextEncoder()
   let tempData = ''
   let fallbackAttempts = 0
+  let fallbackFrom: string | undefined
   const stream = new ReadableStream({
     async start(controller) {
+      let usage: TokenUsage = { inputTokens: 0, outputTokens: 0 }
       try {
         for await (const textPart of result.textStream) {
           tempData += textPart
           controller.enqueue(encoder.encode(textPart))
         }
+        usage = await readStreamUsage(result.usage)
 
         // Edge runtime can fail to decode provider stream in some environments.
         // If stream finished but emitted no usable content, fallback to non-stream.
         if (!tempData.trim() && fallbackAttempts < MAX_FALLBACK_ATTEMPTS) {
           fallbackAttempts += 1
-          const fallbackText = await generateTextFallback({ model, messages, payload })
-          if (fallbackText) {
-            tempData = fallbackText
-            controller.enqueue(encoder.encode(fallbackText))
+          fallbackFrom = 'empty-stream'
+          recordSummaryEvent({ ...eventBase, event: 'summarize-fallback', fallbackFrom })
+          const fallback = await generateTextFallback({ model, messages, payload })
+          usage = fallback.usage
+          if (fallback.text) {
+            tempData = fallback.text
+            controller.enqueue(encoder.encode(fallback.text))
           }
         }
 
         controller.close()
-        await cacheCompletedResult(redis, cacheId, tempData)
-        isDev && console.log('========betterResult after streamed========', tempData)
+        if (redis) {
+          await writeSummaryCacheEntry(
+            redis,
+            cacheId,
+            buildSummaryCacheEnvelope({ text: tempData, context: effectiveContext, model: payload.model }),
+          )
+        }
+        recordSummaryEvent({
+          ...eventBase,
+          event: 'summarize-success',
+          latencyMs: Date.now() - startedAt,
+          fallbackFrom,
+          ...usage,
+        })
       } catch (streamError) {
         const classified = classifyUpstreamError(streamError)
-        console.error(`[summarize] stream failed cacheId=${cacheId} kind=${classified.kind}: ${classified.message}`)
 
         // Only degrade to non-stream when nothing was emitted yet; appending a
         // full retry after partial content would duplicate output.
         if (!tempData.trim() && fallbackAttempts < MAX_FALLBACK_ATTEMPTS) {
           fallbackAttempts += 1
+          recordSummaryEvent({ ...eventBase, event: 'summarize-fallback', fallbackFrom: classified.kind })
           try {
-            const fallbackText = await generateTextFallback({ model, messages, payload })
-            tempData = fallbackText
-            controller.enqueue(encoder.encode(fallbackText))
+            const fallback = await generateTextFallback({ model, messages, payload })
+            tempData = fallback.text
+            controller.enqueue(encoder.encode(fallback.text))
             controller.close()
-            await cacheCompletedResult(redis, cacheId, tempData)
-            isDev && console.warn('stream failed, used fallback generateText', classified.kind)
+            if (redis) {
+              await writeSummaryCacheEntry(
+                redis,
+                cacheId,
+                buildSummaryCacheEnvelope({ text: tempData, context: effectiveContext, model: payload.model }),
+              )
+            }
+            recordSummaryEvent({
+              ...eventBase,
+              event: 'summarize-success',
+              latencyMs: Date.now() - startedAt,
+              fallbackFrom: classified.kind,
+              ...fallback.usage,
+            })
             return
           } catch (fallbackError) {
             const fallbackClassified = classifyUpstreamError(fallbackError)
-            console.error(
-              `[summarize] fallback failed cacheId=${cacheId} kind=${fallbackClassified.kind}: ${fallbackClassified.message}`,
-            )
+            recordSummaryEvent({
+              ...eventBase,
+              event: 'summarize-error',
+              errorKind: fallbackClassified.kind,
+              latencyMs: Date.now() - startedAt,
+            })
             controller.error(new Error(`${fallbackClassified.kind}: ${fallbackClassified.message}`))
             return
           }
         }
 
+        recordSummaryEvent({
+          ...eventBase,
+          event: 'summarize-error',
+          errorKind: classified.kind,
+          latencyMs: Date.now() - startedAt,
+        })
         controller.error(new Error(`${classified.kind}: ${classified.message}`))
       }
     },

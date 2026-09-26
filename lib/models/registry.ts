@@ -2,7 +2,8 @@ import { createHash } from 'crypto'
 
 import { CacheIdContext, ResolvedModelTarget } from '~/lib/models/types'
 
-export const SUMMARY_CONFIG_VERSION = 'summary-v2'
+export const SUMMARY_CONFIG_VERSION = 'summary-v3'
+export const SUMMARY_TEMPLATE_VERSION = 'tpl-1'
 export const DEFAULT_PROVIDER_ID = 'openai-compatible'
 export const DEFAULT_PROVIDER_BASE_URL = 'https://api.openai.com/v1'
 export const LEGACY_FALLBACK_MODEL = 'gpt-4o-mini'
@@ -59,7 +60,24 @@ function cacheProviderToken(provider: string, baseUrl: string) {
   return `${provider}-${hash}`
 }
 
-export function resolveCacheIdContext(userConfig?: { baseUrl?: string; model?: string }): CacheIdContext {
+function cacheTranscriptToken(transcriptText: string) {
+  return createHash('sha256').update(transcriptText).digest('hex').slice(0, 12)
+}
+
+export interface ResolveCacheIdContextInput {
+  baseUrl?: string
+  model?: string
+  /**
+   * Raw transcript/description input. Hashed into the cache key so a changed
+   * transcript never reuses an older summary. Optional: callers that cannot
+   * know the input yet (e.g. middleware before the fetch) may omit it.
+   */
+  transcriptText?: string
+  /** Override the template version pin; defaults to SUMMARY_TEMPLATE_VERSION. */
+  templateVersion?: string
+}
+
+export function resolveCacheIdContext(userConfig?: ResolveCacheIdContextInput): CacheIdContext {
   const target = resolveModelTarget(userConfig)
   return {
     provider: cacheProviderToken(target.provider, target.baseUrl),
@@ -67,5 +85,7 @@ export function resolveCacheIdContext(userConfig?: { baseUrl?: string; model?: s
     // Include the resolved model so requests that omit an explicit model
     // never collide across different configured defaults or providers.
     model: target.model,
+    templateVersion: userConfig?.templateVersion || SUMMARY_TEMPLATE_VERSION,
+    ...(userConfig?.transcriptText ? { transcriptHash: cacheTranscriptToken(userConfig.transcriptText) } : {}),
   }
 }

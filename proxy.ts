@@ -3,9 +3,10 @@ import { Redis } from '@upstash/redis'
 import type { NextFetchEvent, NextRequest } from 'next/server'
 import { NextResponse } from 'next/server'
 import { persistCachedSummary } from '~/lib/history/persistCachedSummary'
+import { readValidatedSummary } from '~/lib/observability/summaryCache'
 import { resolveCacheIdContext } from '~/lib/models/registry'
 import { SummarizeParams } from '~/lib/types'
-import { getCacheId } from '~/utils/getCacheId'
+import { getCacheId, getCacheReadIdCandidates } from '~/utils/getCacheId'
 import { validateLicenseKey } from './lib/lemon'
 import { checkOpenaiApiKeys } from './lib/openai/checkOpenaiApiKey'
 import { ratelimitForApiKeyIps, ratelimitForFreeAccounts, ratelimitForIps } from './lib/upstash'
@@ -79,6 +80,7 @@ export async function proxy(req: NextRequest, context: NextFetchEvent) {
     // handler writes always land on the same cache key.
     const cacheContext = resolveCacheIdContext({ baseUrl: userConfig.baseUrl, model: videoConfig.model })
     const cacheId = getCacheId(videoConfig, cacheContext)
+    const readCandidates = getCacheReadIdCandidates(videoConfig, cacheContext)
     const ipIdentifier =
       req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || req.headers.get('x-real-ip') || '127.0.0.11'
 
@@ -138,9 +140,16 @@ export async function proxy(req: NextRequest, context: NextFetchEvent) {
       }
     }
 
-    const result = await redis.get<string>(cacheId)
-    if (result) {
-      console.log('hit cache for ', cacheId)
+    const lookup = await readValidatedSummary(redis, {
+      cacheId,
+      fallbackIds: readCandidates.slice(1),
+      origin: 'middleware',
+    })
+    if (lookup.kind === 'hit' || lookup.kind === 'legacy-hit') {
+      const result = lookup.text
+      // Served as-is: the middleware cannot know the transcript hash, so it
+      // only reaches entries written before transcript hashing (TTL-bounded).
+      // Nothing is ever written back — a version bump stays an invalidation.
       if (isChatRequest(req)) {
         const cachedResponse = new NextResponse(result, {
           status: 200,
