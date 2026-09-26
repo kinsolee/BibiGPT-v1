@@ -641,6 +641,15 @@ export class JobEngine {
         if (error instanceof JobFailureError && error.code === 'LOST_LOCK') {
           throw error
         }
+        // reduce 的 retry/backoff 窗口内收到的取消必须走取消收尾，
+        // 否则显式取消会落成 failed 并污染失败队列的重试/清理语义
+        if (error instanceof JobFailureError && error.code === 'CANCELED') {
+          const snapshot = await this.getJob(jobId)
+          if (snapshot) {
+            await this.finalizeCanceled(snapshot)
+          }
+          throw error
+        }
         const jobError = toJobError(error, reduceStep.index)
         await this.finalizeFailed(jobId, jobError)
         throw new JobFailureError(jobError.code, jobError.message, 'failed')
