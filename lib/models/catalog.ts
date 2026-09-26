@@ -40,10 +40,21 @@ function isTextToTextModality(modality?: string) {
 }
 
 function hasTextInputAndOutput(inputModalities?: string[], outputModalities?: string[]) {
-  if (!Array.isArray(inputModalities) || !Array.isArray(outputModalities)) {
+  const hasInput = Array.isArray(inputModalities)
+  const hasOutput = Array.isArray(outputModalities)
+  if (!hasInput && !hasOutput) {
     return null
   }
-  return inputModalities.includes('text') && outputModalities.includes('text')
+  // Non-text output can never summarize, even when input metadata is missing.
+  if (hasOutput && !outputModalities!.includes('text')) {
+    return false
+  }
+  if (hasInput && hasOutput) {
+    return inputModalities!.includes('text') && outputModalities!.includes('text')
+  }
+  // Text-capable output with unknown input metadata: keep, id heuristics
+  // filter out known audio-only models whose catalogs omit input modalities.
+  return null
 }
 
 export function isTextSummarizationModel(model: RawCatalogModel): boolean {
