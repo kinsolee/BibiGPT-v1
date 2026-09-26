@@ -79,7 +79,7 @@ export function UserKeyInput(props: UserKeyInputProps) {
               href={CHECKOUT_URL}
               target="_blank"
               rel="noopener noreferrer"
-              className="mt-4 mb-6 pl-2 font-semibold text-sky-500 dark:text-sky-400"
+              className="mb-6 mt-4 pl-2 font-semibold text-sky-500 dark:text-sky-400"
             >
               https://shop.jimmylv.cn
             </a>

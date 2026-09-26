@@ -10,7 +10,7 @@ const poppins = Poppins({ weight: '800', subsets: ['latin'] })
 
 export default function Header({ showSingIn }: { showSingIn: (show: boolean) => void }) {
   return (
-    <header className="supports-backdrop-blur:bg-white/60 max-w-8xl sticky top-0 z-40 mx-auto w-full flex-none border-b border-slate-900/10 bg-white/95 pt-2 backdrop-blur  transition-colors duration-500 dark:border-slate-50/[0.06] dark:border-slate-300/10 dark:bg-transparent lg:z-50 lg:mx-0 lg:border-0 lg:border-b lg:border-slate-900/10 lg:px-8">
+    <header className="supports-backdrop-blur:bg-white/60 max-w-8xl sticky top-0 z-40 mx-auto w-full flex-none border-b border-slate-900/10 bg-white/95 pt-2 backdrop-blur  transition-colors duration-500 dark:border-slate-300/10 dark:border-slate-50/[0.06] dark:bg-transparent lg:z-50 lg:mx-0 lg:border-0 lg:border-b lg:border-slate-900/10 lg:px-8">
       <div className="flex items-center justify-between px-3 sm:px-3">
         <div className="flex items-center space-x-3">
           <a href="https://space.bilibili.com/37648256" target="_blank" rel="noopener noreferrer">
@@ -26,7 +26,7 @@ export default function Header({ showSingIn }: { showSingIn: (show: boolean) => 
             className="z-50 mx-4 flex hidden w-auto justify-center border-b border-slate-900/10 py-4 dark:border-slate-300/10 lg:mx-0 lg:block lg:border-0 lg:px-8"
           >
             <a
-              className="ml-3 hidden items-center rounded-full bg-sky-400/10 py-1 px-3 text-xs font-medium leading-5 text-sky-600 hover:bg-sky-400/20 dark:text-sky-400 xl:flex"
+              className="ml-3 hidden items-center rounded-full bg-sky-400/10 px-3 py-1 text-xs font-medium leading-5 text-sky-600 hover:bg-sky-400/20 dark:text-sky-400 xl:flex"
               href="/release"
               target="_blank"
             >

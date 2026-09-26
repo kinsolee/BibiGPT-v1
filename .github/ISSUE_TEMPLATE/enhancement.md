@@ -1,8 +1,8 @@
 ---
 name: 功能改善
 about: 欢迎分享您的改善建议！
-title: "🚀 功能改善 "
-labels: ["enhancement"]
+title: '🚀 功能改善 '
+labels: ['enhancement']
 ---
 
 # 功能改善建议 🚀
@@ -14,6 +14,5 @@ labels: ["enhancement"]
 请简要描述您的功能改善建议，包括您的目标和想法。
 
 如果您的建议是解决某个特定问题的，请尽可能提供更多的上下文和细节。
-
 
 感谢您的分享和支持！🙏

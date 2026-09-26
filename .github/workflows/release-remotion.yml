@@ -16,7 +16,7 @@ jobs:
         with:
           node-version: 16
       - name: Run Relano
-        uses: "Just-Moh-it/relano@v1"
+        uses: 'Just-Moh-it/relano@v1'
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           releaseNotes: ${{ github.event.release.body }}

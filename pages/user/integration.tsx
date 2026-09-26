@@ -36,7 +36,7 @@ export default () => {
                     href="https://v.flomoapp.com/mine?source=incoming_webhook"
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="mt-4 mb-6 pl-2 font-semibold text-sky-500 dark:text-sky-400"
+                    className="mb-6 mt-4 pl-2 font-semibold text-sky-500 dark:text-sky-400"
                   >
                     https://v.flomoapp.com/mine?source=incoming_webhook
                   </a>
@@ -62,7 +62,7 @@ export default () => {
                     href="https://open.feishu.cn/document/ukTMukTMukTM/ucTM5YjL3ETO24yNxkjN?lang=zh-CN"
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="mt-4 mb-6 pl-2 font-semibold text-sky-500 dark:text-sky-400"
+                    className="mb-6 mt-4 pl-2 font-semibold text-sky-500 dark:text-sky-400"
                   >
                     https://open.feishu.cn/document/ukTMukTMukTM/ucTM5YjL3ETO24yNxkjN?lang=zh-CN
                   </a>

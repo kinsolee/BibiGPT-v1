@@ -6,7 +6,7 @@ import { buttonVariants } from '@/components/ui/button'
 
 export default function Footer() {
   return (
-    <footer className="z-50 mt-5 mb-3 flex h-16 w-full flex-col items-center justify-between space-y-3 bg-white px-3 pt-4 text-center text-slate-400 sm:mb-0 sm:h-20 sm:flex-row sm:pt-2 lg:px-12">
+    <footer className="z-50 mb-3 mt-5 flex h-16 w-full flex-col items-center justify-between space-y-3 bg-white px-3 pt-4 text-center text-slate-400 sm:mb-0 sm:h-20 sm:flex-row sm:pt-2 lg:px-12">
       <div className="flex flex-col items-center text-sm text-slate-500 sm:items-start sm:text-left">
         <div>
           想要更强大的版本？
