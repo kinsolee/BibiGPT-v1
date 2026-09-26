@@ -487,14 +487,24 @@ export class JobEngine {
   /**
    * 异常路径兜底（如后台启动失败）：job 尚未到终态时落 failed，
    * 保证轮询方能观察到终态/可重试状态；已终态则不动。返回是否迁移。
+   * 迁移前必须取得 job 执行锁：锁被占说明仍有活跃 owner 在执行/管理该
+   * job，failover 无权覆盖其 running 记录与 checkpoint。
    */
   async failJobIfNotTerminal(jobId: string, code: string, message: string): Promise<boolean> {
-    const snapshot = await this.getJob(jobId)
-    if (!snapshot || isTerminalJobStatus(snapshot.record.status)) {
+    const holder = `failover:${jobId}:${Math.random().toString(36).slice(2)}`
+    if (!(await this.options.store.acquireJobLock(jobId, holder, this.lockTtlMs).catch(() => false))) {
       return false
     }
-    await this.finalizeFailed(jobId, { code, message })
-    return true
+    try {
+      const snapshot = await this.getJob(jobId)
+      if (!snapshot || isTerminalJobStatus(snapshot.record.status)) {
+        return false
+      }
+      await this.finalizeFailed(jobId, { code, message })
+      return true
+    } finally {
+      await this.options.store.releaseJobLock(jobId, holder)
+    }
   }
 
   private async executeJob(
