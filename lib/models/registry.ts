@@ -59,10 +59,13 @@ function cacheProviderToken(provider: string, baseUrl: string) {
   return `${provider}-${hash}`
 }
 
-export function resolveCacheIdContext(userConfig?: { baseUrl?: string }): CacheIdContext {
-  const target = resolveModelTarget({ baseUrl: userConfig?.baseUrl })
+export function resolveCacheIdContext(userConfig?: { baseUrl?: string; model?: string }): CacheIdContext {
+  const target = resolveModelTarget(userConfig)
   return {
     provider: cacheProviderToken(target.provider, target.baseUrl),
     promptVersion: SUMMARY_CONFIG_VERSION,
+    // Include the resolved model so requests that omit an explicit model
+    // never collide across different configured defaults or providers.
+    model: target.model,
   }
 }

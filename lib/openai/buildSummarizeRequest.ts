@@ -64,7 +64,7 @@ export async function buildSummarizeOpenAIPayload({ videoConfig, userConfig }: S
     stream: Boolean(videoConfig.enableStream ?? true),
   }
 
-  const cacheContext = resolveCacheIdContext({ baseUrl })
+  const cacheContext = resolveCacheIdContext({ baseUrl, model: videoConfig.model })
 
   return { openAiPayload, userKey, baseUrl: modelTarget.baseUrl, cacheContext, modelTarget, videoId }
 }

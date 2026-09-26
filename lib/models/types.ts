@@ -16,6 +16,7 @@ export interface ClassifiedUpstreamError {
 export interface CacheIdContext {
   provider: string
   promptVersion: string
+  model?: string
 }
 
 export interface ResolvedModelTarget {

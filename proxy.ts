@@ -76,7 +76,7 @@ export async function proxy(req: NextRequest, context: NextFetchEvent) {
 
     // Same deterministic resolution as fetchOpenAIResult so proxy reads and
     // handler writes always land on the same cache key.
-    const cacheContext = resolveCacheIdContext({ baseUrl: userConfig.baseUrl })
+    const cacheContext = resolveCacheIdContext({ baseUrl: userConfig.baseUrl, model: videoConfig.model })
     const cacheId = getCacheId(videoConfig, cacheContext)
     const ipIdentifier =
       req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || req.headers.get('x-real-ip') || '127.0.0.11'

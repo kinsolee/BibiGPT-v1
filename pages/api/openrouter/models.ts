@@ -16,6 +16,14 @@ const DEFAULT_CATALOG_URL = 'https://openrouter.ai/api/v1/models'
 const CATALOG_TIMEOUT_MS = 8000
 const MODELS_LIMIT = Number(process.env.OPENROUTER_MODELS_LIMIT || 120)
 
+function originOf(url: string) {
+  try {
+    return new URL(url).origin
+  } catch {
+    return ''
+  }
+}
+
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== 'GET') {
     res.setHeader('Allow', 'GET')
@@ -26,14 +34,27 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   const defaultModel = getDefaultModelId()
 
   try {
-    const apiKey = process.env.OPENAI_COMPATIBLE_API_KEY || process.env.OPENAI_API_KEY
+    const headers: Record<string, string> = {
+      'HTTP-Referer': process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000',
+      'X-OpenRouter-Title': 'BibiGPT',
+    }
+    // Never send the provider API key to a third-party catalog host: attach it
+    // only when explicitly overridden via MODEL_CATALOG_API_KEY, or when the
+    // catalog endpoint shares the provider's origin (e.g. Zhipu /models).
+    const catalogApiKey = process.env.MODEL_CATALOG_API_KEY?.trim()
+    const providerBaseUrl = process.env.OPENAI_COMPATIBLE_BASE_URL?.trim()
+    if (catalogApiKey) {
+      headers.Authorization = `Bearer ${catalogApiKey}`
+    } else if (
+      process.env.OPENAI_COMPATIBLE_API_KEY &&
+      providerBaseUrl &&
+      originOf(catalogUrl) === originOf(providerBaseUrl)
+    ) {
+      headers.Authorization = `Bearer ${process.env.OPENAI_COMPATIBLE_API_KEY}`
+    }
     const response = await fetch(catalogUrl, {
       signal: AbortSignal.timeout(CATALOG_TIMEOUT_MS),
-      headers: {
-        'HTTP-Referer': process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000',
-        'X-OpenRouter-Title': 'BibiGPT',
-        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
-      },
+      headers,
     })
 
     if (!response.ok) {
@@ -63,7 +84,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return res.status(200).json({
       updatedAt: new Date().toISOString(),
       source: 'catalog',
-      catalogUrl,
       defaultModel,
       latestModel,
       models: visibleModels,

@@ -107,6 +107,27 @@ record(
 )
 record('cache key contains prompt version', baseKey.includes(SUMMARY_CONFIG_VERSION), baseKey)
 
+// omitted-model requests must key on the resolved default model
+const noModelConfig = { ...base, model: undefined }
+const resolvedCtx = resolveCacheIdContext({})
+record(
+  'omitted model resolves to env default in cache context',
+  resolvedCtx.model === 'glm-4.6',
+  String(resolvedCtx.model),
+)
+record(
+  'omitted model uses resolved default in key',
+  getCacheId(noModelConfig, resolvedCtx).includes('glm-4.6'),
+  getCacheId(noModelConfig, resolvedCtx),
+)
+process.env.OPENAI_COMPATIBLE_MODEL = 'glm-5.3'
+const newDefaultCtx = resolveCacheIdContext({})
+record(
+  'changing env default model changes the key for omitted-model requests',
+  getCacheId(noModelConfig, newDefaultCtx) !== getCacheId(noModelConfig, resolvedCtx),
+)
+process.env.OPENAI_COMPATIBLE_MODEL = 'glm-4.6'
+
 // 2. equivalent defaults collapse to the same key
 record(
   'unset bullet/outline defaults match explicit defaults',

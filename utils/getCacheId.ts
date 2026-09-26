@@ -21,7 +21,7 @@ export function getCacheId(videoConfig: VideoConfig, context?: CacheIdContext) {
     context?.promptVersion || 'summary-v1',
     videoId,
     context?.provider || 'default',
-    normalizeModelId(model),
+    normalizeModelId(model || context?.model),
     outputLanguage || DEFAULT_LANGUAGE,
     showTimestamp ? 'ts' : 'nots',
     showEmoji ? 'emoji' : 'noemoji',
