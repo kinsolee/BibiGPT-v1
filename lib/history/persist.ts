@@ -1,27 +1,10 @@
-import crypto from 'node:crypto'
 import type { SupabaseClient } from '@supabase/supabase-js'
+import { sha256Hex, stableStringify } from './hash'
 import { MediaDocumentMetadata, TranscriptSegment } from './types'
 
 export const PROMPT_VERSION = 'v1'
 
-function sha256(value: string) {
-  return crypto.createHash('sha256').update(value).digest('hex')
-}
-
-function stableStringify(value: unknown): string {
-  if (value === null || typeof value !== 'object') {
-    return JSON.stringify(value ?? null)
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map(stableStringify).join(',')}]`
-  }
-  const entries = Object.entries(value as Record<string, unknown>)
-    .filter(([, v]) => v !== undefined)
-    .sort(([a], [b]) => a.localeCompare(b))
-  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`).join(',')}}`
-}
-
-export function hashTranscriptInput(
+export async function hashTranscriptInput(
   meta: Pick<MediaDocumentMetadata, 'service' | 'sourceRef' | 'sourcePage'>,
   segments: TranscriptSegment[],
   fullText?: string | null,
@@ -33,11 +16,11 @@ export function hashTranscriptInput(
     segments: segments.map((s) => [s.start, s.end, s.text]),
     fullText: fullText ?? null,
   })
-  return sha256(payload)
+  return sha256Hex(payload)
 }
 
-export function hashSummaryInput(transcriptHash: string, config: Record<string, unknown>, model: string | null) {
-  return sha256(stableStringify({ transcriptHash, config, model: model ?? null, promptVersion: PROMPT_VERSION }))
+export async function hashSummaryInput(transcriptHash: string, config: Record<string, unknown>, model: string | null) {
+  return sha256Hex(stableStringify({ transcriptHash, config, model: model ?? null, promptVersion: PROMPT_VERSION }))
 }
 
 export type PersistSummarizedContentParams = {
@@ -221,7 +204,7 @@ export async function persistSummarizedContent(params: PersistSummarizedContentP
 
   const contentId = await upsertContent(supabase, userId, media, sourceMetadata)
 
-  const transcriptHash = hashTranscriptInput(media, segments, params.transcriptFullText ?? null)
+  const transcriptHash = await hashTranscriptInput(media, segments, params.transcriptFullText ?? null)
   const transcriptId = await upsertTranscript(
     supabase,
     userId,
@@ -233,7 +216,7 @@ export async function persistSummarizedContent(params: PersistSummarizedContentP
     params.transcriptLang ?? null,
   )
 
-  const summaryHash = hashSummaryInput(transcriptHash, config, model)
+  const summaryHash = await hashSummaryInput(transcriptHash, config, model)
   const existingSummary = await supabase
     .from('summaries')
     .select('id, version')

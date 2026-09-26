@@ -2,6 +2,7 @@ import { createMiddlewareSupabaseClient } from '@supabase/auth-helpers-nextjs'
 import { Redis } from '@upstash/redis'
 import type { NextFetchEvent, NextRequest } from 'next/server'
 import { NextResponse } from 'next/server'
+import { persistCachedSummary } from '~/lib/history/persistCachedSummary'
 import { SummarizeParams } from '~/lib/types'
 import { getCacheId } from '~/utils/getCacheId'
 import { validateLicenseKey } from './lib/lemon'
@@ -137,10 +138,31 @@ export async function proxy(req: NextRequest, context: NextFetchEvent) {
     if (result) {
       console.log('hit cache for ', cacheId)
       if (isChatRequest(req)) {
-        return new NextResponse(result, {
+        const cachedResponse = new NextResponse(result, {
           status: 200,
           headers: { 'content-type': 'text/plain; charset=utf-8' },
         })
+        // 登录用户命中旧缓存时渐进导入历史（后台执行，不影响缓存快速路径）
+        try {
+          const supabase = createMiddlewareSupabaseClient({ req, res: cachedResponse })
+          const {
+            data: { session },
+          } = await supabase.auth.getSession()
+          if (session?.user) {
+            context.waitUntil(
+              persistCachedSummary({
+                supabase,
+                userId: session.user.id,
+                videoConfig,
+                cacheId,
+                summaryText: result,
+              }).catch((persistError) => console.error('persist cached summary failed:', persistError)),
+            )
+          }
+        } catch (sessionError) {
+          console.error('cache-hit history resolve failed:', sessionError)
+        }
+        return cachedResponse
       }
       return NextResponse.json(result)
     }

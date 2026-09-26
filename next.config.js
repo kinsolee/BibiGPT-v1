@@ -28,16 +28,21 @@ const nextConfig = {
     ],
   },
   async rewrites() {
-    return [
-      {
-        source: '/api/:path*',
-        destination: `${process.env.INTERNAL_API_HOSTNAME || ''}/api/:path*`,
-      },
+    const rewrites = [
       {
         source: '/blocked',
         destination: '/shop',
       },
     ]
+    // 未配置或非完整 URL（如裸 hostname）时跳过该 rewrite，避免 next build 校验失败
+    const internalApiHostname = process.env.INTERNAL_API_HOSTNAME || ''
+    if (/^https?:\/\//.test(internalApiHostname)) {
+      rewrites.unshift({
+        source: '/api/:path*',
+        destination: `${internalApiHostname}/api/:path*`,
+      })
+    }
+    return rewrites
   },
 }
 
