@@ -35,6 +35,12 @@ const LIMIT_COUNT = 6200 // 2000 is a buffer
  * 6200 上限，否则 chunk 文本会在拼 prompt 时被二次截断丢内容。
  */
 export const DEFAULT_CHUNK_BYTE_LIMIT = 6000
+/**
+ * timestamp 模式预算：getUserSubtitleWithTimestampPrompt 会对文本再
+ * JSON.stringify（引号/反斜杠转义膨胀）后才过 6200 限幅；预留 ~13% 编码
+ * 开销，保证序列化后仍不触发二次截断。
+ */
+export const TIMESTAMP_CHUNK_BYTE_LIMIT = 5200
 
 export interface TranscriptChunk {
   index: number

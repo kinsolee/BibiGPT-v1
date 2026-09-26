@@ -61,9 +61,13 @@ export function toJobError(error: unknown, stepIndex: number): JobError {
   return { code: classified.kind, message: classified.message, stepIndex }
 }
 
-/** 持久化前剥离 provider API key：job record 会明文进 Redis（7 天 TTL），密钥绝不能落盘 */
-function stripApiKey(params: SummaryJobParams): SummaryJobParams {
-  return { ...params, apiKey: '' }
+/**
+ * 持久化前剥离凭据（顶层 apiKey 与 userConfig.userKey）：
+ * job record 会明文进 Redis（7 天 TTL），任何密钥都不能落盘；
+ * 执行时由当次请求重新注入。
+ */
+function stripSecrets(params: SummaryJobParams): SummaryJobParams {
+  return { ...params, apiKey: '', userConfig: { ...params.userConfig, userKey: undefined } }
 }
 
 function buildSteps(chunkCount: number, maxAttempts: number): JobStepRecord[] {
@@ -169,15 +173,15 @@ export class JobEngine {
     return jobIds.length
   }
 
-  /** 取消：不在执行中的 job 直接置终态；执行中的在步骤/重试间隙停下；幂等 */
+  /**
+   * 取消（跨实例）：把取消请求落入共享存储，持有锁的执行实例在步骤检查点
+   * 读取并兑现（保证步骤写入者唯一，避免终态互相覆盖）。没有任何实例在执行
+   * （无锁）时由本调用直接收尾终态。幂等。
+   */
   async cancel(jobId: string): Promise<boolean> {
     const snapshot = await this.getJob(jobId)
     if (!snapshot) {
       return false
-    }
-    if (this.runningJobs.has(jobId)) {
-      this.canceledJobs.add(jobId)
-      return true
     }
     if (snapshot.record.status === 'succeeded') {
       return false
@@ -185,8 +189,35 @@ export class JobEngine {
     if (snapshot.record.status === 'failed' || snapshot.record.status === 'canceled') {
       return true
     }
-    await this.finalizeCanceled(snapshot)
+    this.canceledJobs.add(jobId)
+    try {
+      await this.options.store.requestCancel(jobId)
+    } catch (error) {
+      // 共享标志写失败时退化为本地标志：本进程执行仍可兑现，跨实例尽力而为
+      console.error(`[jobs] persist cancel flag failed for ${jobId}:`, error)
+    }
+    const runningHere = this.runningJobs.has(jobId)
+    if (!runningHere && !(await this.options.store.hasJobLock(jobId).catch(() => false))) {
+      await this.finalizeCanceled(snapshot)
+    }
     return true
+  }
+
+  /** 步骤检查点统一走这里：本地标志或共享存储标志任一命中即视为取消 */
+  private async checkCanceled(jobId: string): Promise<boolean> {
+    if (this.canceledJobs.has(jobId)) {
+      return true
+    }
+    try {
+      if (await this.options.store.isCancelRequested(jobId)) {
+        this.canceledJobs.add(jobId)
+        return true
+      }
+    } catch (error) {
+      // 标志读取失败按未取消处理（fail-open），下一检查点再试
+      console.error(`[jobs] read cancel flag failed for ${jobId}:`, error)
+    }
+    return false
   }
 
   /**
@@ -229,8 +260,8 @@ export class JobEngine {
         checkpoint: [],
         error: null,
         resultText: null,
-        // apiKey 只随运行时参数传递，持久化记录一律剥离
-        params: stripApiKey(params),
+        // apiKey/userKey 只随运行时参数传递，持久化记录一律剥离
+        params: stripSecrets(params),
       }
       steps = buildSteps(params.chunks.length, this.stepMaxAttempts)
       await store.saveJob(record)
@@ -273,8 +304,12 @@ export class JobEngine {
       await store.saveJob(record)
     }
 
-    // 运行时参数：持久化 params（无 key）+ 本次请求带来的 key
-    const runParams: SummaryJobParams = { ...record.params, apiKey: params.apiKey }
+    // 运行时参数：持久化 params（无凭据）+ 本次请求带来的凭据
+    const runParams: SummaryJobParams = {
+      ...record.params,
+      apiKey: params.apiKey,
+      userConfig: { ...record.params.userConfig, userKey: params.userConfig.userKey },
+    }
 
     this.canceledJobs.delete(jobId)
     this.runningJobs.add(jobId)
@@ -284,6 +319,7 @@ export class JobEngine {
       this.runningJobs.delete(jobId)
       this.canceledJobs.delete(jobId)
       await store.releaseJobLock(jobId, holderId)
+      await store.clearCancelFlag(jobId).catch(() => undefined)
     }
 
     const finalRecord = await store.loadJob(jobId)
@@ -363,16 +399,23 @@ export class JobEngine {
     await store.saveSteps(jobId, steps)
     await store.removeFailedIndex(jobId)
 
+    // 持久化写串行化：多 worker 并发 commit 时，按发起顺序落盘，防止慢的
+    // saveSteps 完成后覆盖快照回退（内存闭包 steps 始终单调前进）
+    let persistChain: Promise<void> = Promise.resolve()
+    const enqueuePersist = (write: () => Promise<void>): Promise<void> => {
+      persistChain = persistChain.then(write, write)
+      return persistChain
+    }
     const persistStep = async (index: number, patch: Partial<JobStepRecord>) => {
       steps = steps.map((step) => (step.index === index ? { ...step, ...patch } : step))
-      await store.saveSteps(jobId, steps)
+      await enqueuePersist(() => store.saveSteps(jobId, steps))
     }
     const persistJob = async () => {
       const succeededChunks = steps
         .filter((step) => step.kind === 'chunk' && step.status === 'succeeded')
         .map((step) => step.chunkIndex!)
       working = { ...working, checkpoint: succeededChunks, updatedAt: this.now() }
-      await store.saveJob(working)
+      await enqueuePersist(() => store.saveJob(working))
     }
 
     // ---- map：worker pool 并行执行 chunk 摘要，并发不超上限 ----
@@ -382,7 +425,7 @@ export class JobEngine {
     const runState: { failure: JobError | null } = { failure: null }
 
     const worker = async () => {
-      while (!runState.failure && !this.canceledJobs.has(jobId)) {
+      while (!(await this.checkCanceled(jobId)) && !runState.failure) {
         const claimed = cursor
         cursor += 1
         if (claimed >= pendingIndexes.length) {
@@ -405,7 +448,7 @@ export class JobEngine {
     }
     await Promise.all(Array.from({ length: this.concurrency }, () => worker()))
 
-    if (this.canceledJobs.has(jobId)) {
+    if (await this.checkCanceled(jobId)) {
       const snapshot = await this.getJob(jobId)
       if (snapshot) {
         await this.finalizeCanceled(snapshot)
@@ -443,7 +486,7 @@ export class JobEngine {
     }
 
     // reduce 完成/复用后、写入 succeeded 终态前，最后一次兑现取消请求
-    if (this.canceledJobs.has(jobId)) {
+    if (await this.checkCanceled(jobId)) {
       const snapshot = await this.getJob(jobId)
       if (snapshot) {
         await this.finalizeCanceled(snapshot)
@@ -469,8 +512,9 @@ export class JobEngine {
   /**
    * 单步骤执行：attempt 循环 + 超时 + 退避；非重试型错误立即失败。
    * fetchOpenAIResult 不支持注入 abortSignal，无法真正中止超时的 provider
-   * 调用；因此超时后必须等该次 attempt settle 才能进入重试，否则反复超时下
-   * 实际在途请求数会突破并发上限（孤儿结果被忽略，缓存写入幂等无害）。
+   * 调用；因此超时后有界等待该次 attempt settle（最多再等一个超时周期，
+   * provider promise 永不 settle 时不会挂死 job），然后才进入重试判定，
+   * 否则反复超时下实际在途请求数会突破并发上限（孤儿结果被忽略，缓存写入幂等无害）。
    */
   private async runStepWithRetries(
     jobId: string,
@@ -503,10 +547,18 @@ export class JobEngine {
         await commit({ status: 'succeeded', output: text, finishedAt: this.now(), error: null })
         return
       } catch (error) {
-        // 超时只是放弃等待，provider 调用仍在途：等它结束（结果丢弃）再判定/重试，
-        // 否则下一个 attempt 立即起跑会让实际并发超过 concurrency 上限
+        // 超时只是放弃等待，provider 调用仍在途。fetchOpenAIResult 不支持
+        // abortSignal，无法中止：有界等待它 settle（上界 = 一个超时周期）。
+        // - settle：正常进入重试判定，保证重试与孤儿不同时在途（并发上限不被突破）
+        // - 到界仍未 settle：按 TIMEOUT 判死本步骤（不重试），既不挂死 job，
+        //   也不让重试与永挂请求叠加
         if (error instanceof StepTimeoutError) {
-          await attemptPromise.catch(() => undefined)
+          const settled = await this.waitUntilSettled(attemptPromise, this.stepTimeoutMs)
+          if (!settled) {
+            const timeoutError = toJobError(error, step.index)
+            await commit({ status: 'failed', error: timeoutError, finishedAt: this.now() })
+            throw new JobFailureError(timeoutError.code, timeoutError.message, 'failed')
+          }
         }
         const jobError = toJobError(error, step.index)
         const classified = classifyUpstreamError(error)
@@ -548,6 +600,21 @@ export class JobEngine {
         clearTimeout(timer)
       }
     }
+  }
+
+  /** 有界等待 promise settle：返回是否在上界内 settle（false = 到界仍在途） */
+  private waitUntilSettled(promise: Promise<unknown>, boundMs: number): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      const finish = (settled: boolean) => {
+        clearTimeout(timer)
+        resolve(settled)
+      }
+      const timer = setTimeout(() => finish(false), boundMs)
+      void promise.then(
+        () => finish(true),
+        () => finish(true),
+      )
+    })
   }
 
   private async finalizeCanceled(snapshot: JobSnapshot) {

@@ -8,7 +8,7 @@ import { persistChatHistory, resolveHistoryUser } from '~/lib/history/persistCha
 import { writeWebStreamToNodeResponse } from '~/lib/openai/writeWebStreamToNodeResponse'
 import { JobFailureError } from '~/lib/jobs/engine'
 import { jobErrorToHttpStatus } from '~/lib/jobs/errors'
-import { runSummaryToCompletion } from '~/lib/jobs/summaryJob'
+import { runSummaryToCompletion, startSummaryJobInBackground } from '~/lib/jobs/summaryJob'
 import { isValidSummaryText } from '~/lib/jobs/validation'
 
 if (!process.env.OPENAI_API_KEY && !process.env.OPENAI_COMPATIBLE_API_KEY) {
@@ -60,11 +60,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       detailTokens,
     } = await buildSummarizeOpenAIPayload({ videoConfig, userConfig })
 
-    // 长视频：多 chunk map-reduce job（幂等、可续传、可取消），完成后一次性流式回写全文
+    // 长视频：多 chunk map-reduce job（幂等、可续传、可取消）。
+    // 默认同步驱动到终态后一次性流式回写全文（自托管 docker 无平台时限，
+    // 前端契约是纯文本流）；BIBI_JOB_ASYNC_RETURN=1 时入队即返回 jobId，
+    // 由调用方轮询 /api/sumup?jobId=（轮询属管理面，需 admin token）。
     if (plan === 'job') {
       const apiKey = await selectApiKeyAndActivatedLicenseKey(userKey, videoId)
-      const historyUser = await resolveHistoryUser(req, res)
-      const result = await runSummaryToCompletion({
+      const jobInput = {
         videoConfig,
         userConfig,
         title,
@@ -75,7 +77,15 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         promptVersion: cacheContext.promptVersion,
         detailTokens,
         apiKey,
-      })
+      }
+      if (process.env.BIBI_JOB_ASYNC_RETURN === '1') {
+        const { jobId } = startSummaryJobInBackground(jobInput)
+        res.setHeader('Content-Type', 'application/json; charset=utf-8')
+        res.setHeader('X-Bibi-Job-Id', jobId)
+        return res.status(202).send(JSON.stringify({ jobId, status: 'queued', poll: `/api/sumup?jobId=${jobId}` }))
+      }
+      const historyUser = await resolveHistoryUser(req, res)
+      const result = await runSummaryToCompletion(jobInput)
 
       res.setHeader('Content-Type', 'text/plain; charset=utf-8')
       res.setHeader('Cache-Control', 'no-cache')

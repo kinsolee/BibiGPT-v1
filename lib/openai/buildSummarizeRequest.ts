@@ -3,6 +3,7 @@ import {
   chunkSubtitles,
   DEFAULT_CHUNK_BYTE_LIMIT,
   getUtf8ByteLength,
+  TIMESTAMP_CHUNK_BYTE_LIMIT,
   TranscriptChunk,
 } from '~/lib/openai/getSmallSizeTranscripts'
 import { ChatGPTAgent, OpenAIStreamPayload } from '~/lib/openai/fetchOpenAIResult'
@@ -98,8 +99,10 @@ export async function buildSummarizeOpenAIPayload({
     throw new SummarizeRequestError(501, 'No subtitle in the video')
   }
 
-  // 确定性切分：短输入恰好 1 个 chunk（文本与旧 join 行为一致），长输入多 chunk 走 job
-  const chunks = subtitlesArray ? chunkSubtitles(subtitlesArray) : chunkPlainText(descriptionText ?? '')
+  // 确定性切分：短输入恰好 1 个 chunk（文本与旧 join 行为一致），长输入多 chunk 走 job。
+  // timestamp 模式收紧预算：prompt 侧会 JSON.stringify 膨胀，防止 6200 二次截断丢内容
+  const byteLimit = shouldShowTimestamp ? TIMESTAMP_CHUNK_BYTE_LIMIT : DEFAULT_CHUNK_BYTE_LIMIT
+  const chunks = subtitlesArray ? chunkSubtitles(subtitlesArray, byteLimit) : chunkPlainText(descriptionText ?? '')
   const plan: SummarizePlan = chunks.length > 1 ? 'job' : 'fast'
   const inputText = subtitlesArray ? chunks[0]?.text ?? '' : descriptionText ?? ''
 

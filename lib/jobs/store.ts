@@ -45,6 +45,13 @@ export interface JobStore {
   acquireJobLock(jobId: string, holderId: string, ttlMs: number): Promise<boolean>
   /** 只有当前持有者能释放（防误删他人锁）；非持有者调用为 no-op */
   releaseJobLock(jobId: string, holderId: string): Promise<void>
+  /** 是否有实例持有该 job 的执行锁（含 TTL 未过期的判断） */
+  hasJobLock(jobId: string): Promise<boolean>
+  /** 取消请求落共享存储：跨实例的 worker 在步骤检查点读取并兑现 */
+  requestCancel(jobId: string): Promise<void>
+  isCancelRequested(jobId: string): Promise<boolean>
+  /** job 到终态后清取消标志 */
+  clearCancelFlag(jobId: string): Promise<void>
 }
 
 /** 开发/测试用内存实现；export 以便 fixture 注入 */
@@ -54,6 +61,7 @@ export class MemoryJobStore implements JobStore {
   private active = new Map<string, number>()
   private failed = new Map<string, number>()
   private locks = new Map<string, { holderId: string; expiresAtMs: number }>()
+  private cancelFlags = new Set<string>()
 
   async loadJob(jobId: string) {
     return this.jobs.get(jobId) ?? null
@@ -119,6 +127,23 @@ export class MemoryJobStore implements JobStore {
     if (existing?.holderId === holderId) {
       this.locks.delete(jobId)
     }
+  }
+
+  async hasJobLock(jobId: string) {
+    const existing = this.locks.get(jobId)
+    return Boolean(existing && existing.expiresAtMs > Date.now())
+  }
+
+  async requestCancel(jobId: string) {
+    this.cancelFlags.add(jobId)
+  }
+
+  async isCancelRequested(jobId: string) {
+    return this.cancelFlags.has(jobId)
+  }
+
+  async clearCancelFlag(jobId: string) {
+    this.cancelFlags.delete(jobId)
   }
 }
 
@@ -204,6 +229,27 @@ class UpstashJobStore implements JobStore {
     if (current === holderId) {
       await this.redis.del(this.lockKey(jobId))
     }
+  }
+
+  async hasJobLock(jobId: string) {
+    return (await this.redis.exists(this.lockKey(jobId))) > 0
+  }
+
+  private cancelKey(jobId: string) {
+    return `${KEY_PREFIX}:cancel:${jobId}`
+  }
+
+  async requestCancel(jobId: string) {
+    await this.redis.set(this.cancelKey(jobId), '1', { ex: KEY_TTL_SECONDS })
+  }
+
+  async isCancelRequested(jobId: string) {
+    const value = await this.redis.get<unknown>(this.cancelKey(jobId))
+    return value !== null && value !== undefined
+  }
+
+  async clearCancelFlag(jobId: string) {
+    await this.redis.del(this.cancelKey(jobId))
   }
 }
 

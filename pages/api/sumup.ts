@@ -7,7 +7,8 @@ import { SummarizeParams } from '~/lib/types'
 import { writeWebStreamToNodeResponse } from '~/lib/openai/writeWebStreamToNodeResponse'
 import { JobFailureError } from '~/lib/jobs/engine'
 import { jobErrorToHttpStatus } from '~/lib/jobs/errors'
-import { getSharedJobEngine, runSummaryToCompletion } from '~/lib/jobs/summaryJob'
+import { requireJobAdminAuth } from '~/lib/jobs/adminAuth'
+import { getSharedJobEngine, runSummaryToCompletion, startSummaryJobInBackground } from '~/lib/jobs/summaryJob'
 import { JobSnapshot } from '~/lib/jobs/types'
 
 if (!process.env.OPENAI_API_KEY && !process.env.OPENAI_COMPATIBLE_API_KEY) {
@@ -54,8 +55,11 @@ function toJobStatusJson(snapshot: JobSnapshot, includeResult: boolean) {
   }
 }
 
-/** GET：job 状态查询（?jobId=...，可选 includeResult=1）与失败队列列表（?list=failed） */
+/** GET：job 状态查询（?jobId=...，可选 includeResult=1）与失败队列列表（?list=failed）；管理面需 admin token */
 async function handleGet(req: NextApiRequest, res: NextApiResponse) {
+  if (!requireJobAdminAuth(req, res)) {
+    return
+  }
   const engine = getSharedJobEngine()
   const { jobId, list, includeResult, olderThanMs } = req.query
 
@@ -85,8 +89,11 @@ type SumupBody = Partial<SummarizeParams> & {
   olderThanMs?: number
 }
 
-/** POST action 分支：job 取消与失败队列清理（不影响既有摘要请求契约） */
-async function handleAction(body: SumupBody, res: NextApiResponse) {
+/** POST action 分支：job 取消与失败队列清理（不影响既有摘要请求契约）；管理面需 admin token */
+async function handleAction(req: NextApiRequest, res: NextApiResponse, body: SumupBody) {
+  if (!requireJobAdminAuth(req, res)) {
+    return
+  }
   const engine = getSharedJobEngine()
   if (body.action === 'cancelJob') {
     if (!body.jobId) {
@@ -116,7 +123,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
   const body = req.body as SumupBody
   if (body?.action === 'cancelJob' || body?.action === 'cleanupJobs') {
-    return handleAction(body, res).catch((error: any) => {
+    return handleAction(req, res, body).catch((error: any) => {
       console.error(`[sumup] job action failed: ${error?.message}`)
       return res.status(500).json({ errorMessage: 'job action failed' })
     })
@@ -133,10 +140,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const { openAiPayload, userKey, baseUrl, cacheContext, videoId, title, plan, chunks, modelTarget, detailTokens } =
       await buildSummarizeOpenAIPayload(normalizedParams)
 
-    // 长视频：多 chunk map-reduce job；成功后按 enableStream 决定流式回写或 JSON 返回
+    // 长视频：多 chunk map-reduce job。BIBI_JOB_ASYNC_RETURN=1 时入队即返回
+    // jobId（自托管长驻进程后台执行，经 GET ?jobId= 轮询），否则同步驱动到终态。
     if (plan === 'job') {
       const apiKey = await selectApiKeyAndActivatedLicenseKey(userKey, videoId)
-      const result = await runSummaryToCompletion({
+      const jobInput = {
         videoConfig,
         userConfig,
         title,
@@ -147,7 +155,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         promptVersion: cacheContext.promptVersion,
         detailTokens,
         apiKey,
-      })
+      }
+      if (process.env.BIBI_JOB_ASYNC_RETURN === '1') {
+        const { jobId } = startSummaryJobInBackground(jobInput)
+        return res.status(202).json({ jobId, status: 'queued', poll: `/api/sumup?jobId=${jobId}` })
+      }
+      const result = await runSummaryToCompletion(jobInput)
       if (videoConfig.enableStream ?? true) {
         res.setHeader('Content-Type', 'text/plain; charset=utf-8')
         res.setHeader('Cache-Control', 'no-cache')
