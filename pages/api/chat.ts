@@ -79,7 +79,26 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         apiKey,
       }
       if (process.env.BIBI_JOB_ASYNC_RETURN === '1') {
-        const { jobId } = await startSummaryJobInBackground(jobInput)
+        // 异步入队也要写 chat history：返回前先解析会话（auth-helpers 需要
+        // 在 res 结束前写 cookie），job 完成后在 onCompleted 回调中落库
+        const historyUser = await resolveHistoryUser(req, res)
+        const { jobId } = await startSummaryJobInBackground(jobInput, {
+          onCompleted: async (result) => {
+            if (isValidSummaryText(result.summaryText)) {
+              await persistChatHistory({
+                historyUser,
+                videoConfig,
+                shouldShowTimestamp: userConfig?.shouldShowTimestamp,
+                videoId,
+                title,
+                subtitlesArray,
+                descriptionText,
+                model: modelTarget.model,
+                summaryText: result.summaryText,
+              })
+            }
+          },
+        })
         res.setHeader('Content-Type', 'application/json; charset=utf-8')
         res.setHeader('X-Bibi-Job-Id', jobId)
         return res.status(202).send(JSON.stringify({ jobId, status: 'queued', poll: `/api/sumup?jobId=${jobId}` }))

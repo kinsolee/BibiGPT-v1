@@ -94,6 +94,24 @@ export function buildSummaryJobDigest(input: SummaryJobInput) {
   return createHash('sha256').update(canonicalJson(material), 'utf8').digest('hex').slice(0, 32)
 }
 
+/**
+ * 合成 provider 缓存身份：把 chunk hash / 输入聚合 hash 编进合成 videoId。
+ * fetchOpenAIResult 的 cacheId 只由 videoConfig+model 派生（getCacheId 不含
+ * transcript 身份），同视频字幕/标题变化后若合成 ID 不变，map/reduce 会从
+ * Redis 读到上一次的陈旧结果。合成 ID 带上内容 hash 后天然分键。
+ */
+export function buildSyntheticChunkVideoId(videoId: string, chunkIndex: number, chunkHash: string) {
+  return `${videoId}#chunk${chunkIndex}-${chunkHash}`
+}
+
+export function buildSyntheticReduceVideoId(videoId: string, chunks: JobChunkSpec[], title: string | null) {
+  const aggregate = createHash('sha256')
+    .update(`${chunks.map((chunk) => chunk.hash).join('|')}|${(title ?? '').trim()}`, 'utf8')
+    .digest('hex')
+    .slice(0, 16)
+  return `${videoId}#reduce-${aggregate}`
+}
+
 function toSummaryJobParams(input: SummaryJobInput): SummaryJobParams {
   return {
     videoConfig: input.videoConfig,
@@ -150,6 +168,8 @@ export function createOpenAIStepRunner(): StepRunner {
     sections: string[],
     sectionRanges: SectionRange[],
     intermediate: boolean,
+    /** 中间层缓存 key 盐：不同层级/组的中间调用必须互不共享缓存 key */
+    keySalt?: string,
   ) => {
     if (sections.some((output) => !output.trim())) {
       throw new JobFailureError('REDUCE_INPUT_EMPTY', 'reduce received empty chunk output', 'failed')
@@ -163,7 +183,9 @@ export function createOpenAIStepRunner(): StepRunner {
       intermediate,
       sectionRanges,
     })
-    const syntheticVideoConfig = { ...params.videoConfig, videoId: `${params.videoConfig.videoId}#reduce` }
+    const baseVideoId = buildSyntheticReduceVideoId(params.videoConfig.videoId, params.chunks, params.title)
+    const syntheticVideoId = intermediate && keySalt ? `${baseVideoId}-${keySalt}` : baseVideoId
+    const syntheticVideoConfig = { ...params.videoConfig, videoId: syntheticVideoId }
     const payload: OpenAIStreamPayload = {
       model: params.model,
       messages: [{ role: ChatGPTAgent.user, content: prompt }],
@@ -202,10 +224,11 @@ export function createOpenAIStepRunner(): StepRunner {
         videoConfig: params.videoConfig,
         shouldShowTimestamp: params.userConfig.shouldShowTimestamp,
       })
-      // 合成 videoId 让每个 chunk 拿到独立 cacheId，避免互相覆盖主视频缓存
+      // 合成 videoId 编入 chunk hash：同视频字幕变化后 map 调用天然分键，
+      // 不会从 Redis 读到上一次的陈旧 chunk 摘要
       const syntheticVideoConfig = {
         ...params.videoConfig,
-        videoId: `${params.videoConfig.videoId}#chunk${chunkIndex}`,
+        videoId: buildSyntheticChunkVideoId(params.videoConfig.videoId, chunkIndex, chunk.hash),
       }
       const payload: OpenAIStreamPayload = {
         model: params.model,
@@ -249,10 +272,11 @@ export function createOpenAIStepRunner(): StepRunner {
         const merged: string[] = []
         const mergedRanges: SectionRange[] = []
         let offset = 0
-        for (const group of groups) {
+        for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
+          const group = groups[groupIndex]
           // 组内各 section 沿用各自原始区间（中间层 header 标注准确）
           const groupRanges = ranges.slice(offset, offset + group.length)
-          merged.push(await callReduceModel(params, group, groupRanges, true))
+          merged.push(await callReduceModel(params, group, groupRanges, true, `L${levels}G${groupIndex}`))
           // 归并后的新 section 区间 = 该组覆盖区间的并集（供下一层/最终层标注）
           mergedRanges.push({
             startSeconds: groupRanges[0]?.startSeconds ?? null,
@@ -365,23 +389,38 @@ export async function summarizeFromBuiltRequest(
  */
 export async function startSummaryJobInBackground(
   input: SummaryJobInput,
-  options: { forceNewResult?: boolean; engine?: JobEngine } = {},
+  options: {
+    forceNewResult?: boolean
+    engine?: JobEngine
+    /** job 成功完成后回调（复用结果同样触发），供调用方补做 history 持久化等收尾 */
+    onCompleted?: (result: SummaryJobResult) => Promise<void>
+  } = {},
 ): Promise<{ jobId: string }> {
   const digest = buildSummaryJobDigest(input)
   const jobId = `job_${digest}`
   const engine = options.engine ?? getSharedJobEngine()
   await engine.ensureJobRecord(jobId, digest, toSummaryJobParams(input))
-  void runSummaryToCompletion(input, options).catch(async (error: unknown) => {
-    const message = error instanceof Error ? error.message : String(error)
-    console.error(`[jobs] background job ${jobId} failed:`, message)
-    // 启动阶段异常（store 错误/锁超时等）时 engine 可能没走到 finalize：
-    // 把未终态记录迁移为 failed，轮询才能看到可重试的终态而不是永远 queued
-    try {
-      await engine.failJobIfNotTerminal(jobId, 'BACKGROUND_START_FAILED', message)
-    } catch (failoverError) {
-      console.error(`[jobs] background job ${jobId} failover failed:`, failoverError)
-    }
-  })
+  void runSummaryToCompletion(input, options)
+    .then(async (result) => {
+      if (options.onCompleted) {
+        try {
+          await options.onCompleted(result)
+        } catch (callbackError) {
+          console.error(`[jobs] background onCompleted callback failed for ${jobId}:`, callbackError)
+        }
+      }
+    })
+    .catch(async (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error)
+      console.error(`[jobs] background job ${jobId} failed:`, message)
+      // 启动阶段异常（store 错误/锁超时等）时 engine 可能没走到 finalize：
+      // 把未终态记录迁移为 failed，轮询才能看到可重试的终态而不是永远 queued
+      try {
+        await engine.failJobIfNotTerminal(jobId, 'BACKGROUND_START_FAILED', message)
+      } catch (failoverError) {
+        console.error(`[jobs] background job ${jobId} failover failed:`, failoverError)
+      }
+    })
   return { jobId }
 }
 
