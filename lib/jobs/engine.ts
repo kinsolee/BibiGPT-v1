@@ -428,6 +428,9 @@ export class JobEngine {
       }
     })
 
+    // 先移出失败队列再写入任何状态：若 cleanupFailedJobs 在「已保存 running
+    // 记录但仍留在 failed 索引」的窗口执行，会把一个正在重跑的 job 整体删除。
+    await store.removeFailedIndex(jobId)
     let working: JobRecord = {
       ...record,
       status: 'running',
@@ -439,7 +442,6 @@ export class JobEngine {
     }
     await store.saveJob(working)
     await store.saveSteps(jobId, steps)
-    await store.removeFailedIndex(jobId)
 
     // 持久化写串行化：多 worker 并发 commit 时，按发起顺序落盘，防止慢的
     // saveSteps 完成后覆盖快照回退（内存闭包 steps 始终单调前进）
