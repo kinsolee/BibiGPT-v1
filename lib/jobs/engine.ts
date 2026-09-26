@@ -1,6 +1,13 @@
 import { classifyUpstreamError } from '~/lib/models/errors'
 import { isValidSummaryText } from '~/lib/jobs/validation'
-import { JobError, JobRecord, JobSnapshot, JobStepRecord, SummaryJobParams } from '~/lib/jobs/types'
+import {
+  JobError,
+  JobRecord,
+  JobSnapshot,
+  JobStepRecord,
+  SummaryJobParams,
+  isTerminalJobStatus,
+} from '~/lib/jobs/types'
 import { JobStore } from '~/lib/jobs/store'
 
 export const DEFAULT_STEP_CONCURRENCY = Number(process.env.BIBI_JOB_STEP_CONCURRENCY) || 2
@@ -132,6 +139,8 @@ export class JobEngine {
   private readonly jobLocks = createKeyedMutex()
   /** jobId → 取消标记；cancel() 置位后，运行循环在下一个检查点停下 */
   private readonly canceledJobs = new Set<string>()
+  /** jobId → 执行权丢失标记（锁续约被拒）：置位后停止一切状态写入并放弃执行 */
+  private readonly lostLockJobs = new Set<string>()
   private readonly runningJobs = new Set<string>()
 
   private readonly options: JobEngineOptions
@@ -204,11 +213,29 @@ export class JobEngine {
       console.error(`[jobs] persist cancel flag failed for ${jobId}:`, error)
     }
     const runningHere = this.runningJobs.has(jobId)
-    if (!runningHere && !(await this.options.store.hasJobLock(jobId).catch(() => false))) {
-      await this.finalizeCanceled(snapshot)
+    if (runningHere) {
+      // 本进程执行者会在检查点兑现取消
+      return true
+    }
+    // 直接收尾前必须先取得执行权：否则 hasJobLock 检查与 finalize 之间可能
+    // 有 worker 拿锁开跑，canceled 终态会覆盖其 running 记录
+    const cancelHolder = `${jobId}:cancel:${Math.random().toString(36).slice(2)}`
+    const acquired = await this.options.store.acquireJobLock(jobId, cancelHolder, this.lockTtlMs).catch(() => false)
+    if (!acquired) {
+      // 另一实例正在执行：共享标志已置，其检查点会兑现取消
+      return true
+    }
+    try {
+      // 拿锁后双检状态（等待期间可能已被执行者带向终态）
+      const fresh = await this.getJob(jobId)
+      if (fresh && !isTerminalJobStatus(fresh.record.status)) {
+        await this.finalizeCanceled(fresh)
+      }
       // 无 worker 直接收尾时必须清共享取消标志：否则后续同 digest 重启执行
       // 会在每个检查点命中过期标志被立即取消，job 直到 TTL 过期都不可跑
       await this.options.store.clearCancelFlag(jobId).catch(() => undefined)
+    } finally {
+      await this.options.store.releaseJobLock(jobId, cancelHolder)
     }
     return true
   }
@@ -228,6 +255,16 @@ export class JobEngine {
       console.error(`[jobs] read cancel flag failed for ${jobId}:`, error)
     }
     return false
+  }
+
+  /**
+   * 执行权检查点：续约被拒即视为丢失执行权。命中时调用方必须立即抛
+   * LOST_LOCK 并跳过所有后续 store 写入（终态写入权已归属新持有者）。
+   */
+  private assertLockHeld(jobId: string) {
+    if (this.lostLockJobs.has(jobId)) {
+      throw new JobFailureError('LOST_LOCK', `execution abandoned: job lock lost for ${jobId}`, 'failed')
+    }
   }
 
   /**
@@ -274,16 +311,22 @@ export class JobEngine {
       throw new JobFailureError('JOB_LOCK_BUSY', `another instance is running job ${jobId}`, 'failed')
     }
 
-    // 执行期间周期续约，防止超长 job 超过锁 TTL 后被第二实例抢入
+    // 执行期间周期续约，防止超长 job 超过锁 TTL 后被第二实例抢入；
+    // 续约被拒 = 已失去执行权（TTL 过期后锁被他人持有），立即停工，
+    // 之后的任何状态写入都可能覆盖新持有者
     const renewTimer = setInterval(() => {
       void store
         .renewJobLock(jobId, holderId, this.lockTtlMs)
         .then((renewed) => {
           if (!renewed) {
-            console.error(`[jobs] lock renew rejected for ${jobId} (lost lock?)`)
+            console.error(`[jobs] lock renew rejected for ${jobId}, abandoning execution`)
+            this.lostLockJobs.add(jobId)
           }
         })
-        .catch((error) => console.error(`[jobs] lock renew failed for ${jobId}:`, error))
+        .catch((error) => {
+          console.error(`[jobs] lock renew failed for ${jobId}, abandoning execution:`, error)
+          this.lostLockJobs.add(jobId)
+        })
     }, this.lockRenewIntervalMs)
 
     // 强制重新生成：清空全部已完成步骤与结果，回到全量重跑（在持锁后落盘）
@@ -309,12 +352,14 @@ export class JobEngine {
     }
 
     this.canceledJobs.delete(jobId)
+    this.lostLockJobs.delete(jobId)
     this.runningJobs.add(jobId)
     try {
       await this.executeJob(jobId, record, steps, runParams)
     } finally {
       this.runningJobs.delete(jobId)
       this.canceledJobs.delete(jobId)
+      this.lostLockJobs.delete(jobId)
       clearInterval(renewTimer)
       await store.releaseJobLock(jobId, holderId)
       await store.clearCancelFlag(jobId).catch(() => undefined)
@@ -469,7 +514,7 @@ export class JobEngine {
     const runState: { failure: JobError | null } = { failure: null }
 
     const worker = async () => {
-      while (!(await this.checkCanceled(jobId)) && !runState.failure) {
+      while (!(await this.checkCanceled(jobId)) && !runState.failure && !this.lostLockJobs.has(jobId)) {
         const claimed = cursor
         cursor += 1
         if (claimed >= pendingIndexes.length) {
@@ -492,6 +537,8 @@ export class JobEngine {
     }
     await Promise.all(Array.from({ length: this.concurrency }, () => worker()))
 
+    // 执行权丢失：不写任何终态（写权已归属新持有者），直接放弃
+    this.assertLockHeld(jobId)
     if (await this.checkCanceled(jobId)) {
       const snapshot = await this.getJob(jobId)
       if (snapshot) {
@@ -500,6 +547,9 @@ export class JobEngine {
       throw new JobFailureError('CANCELED', 'job canceled by user', 'canceled')
     }
     if (runState.failure) {
+      if (runState.failure.code === 'LOST_LOCK') {
+        throw new JobFailureError('LOST_LOCK', runState.failure.message, 'failed')
+      }
       await this.finalizeFailed(jobId, runState.failure)
       throw new JobFailureError(runState.failure.code, runState.failure.message, 'failed')
     }
@@ -523,6 +573,9 @@ export class JobEngine {
         )
         reduceStep = steps.find((step) => step.kind === 'reduce')!
       } catch (error) {
+        if (error instanceof JobFailureError && error.code === 'LOST_LOCK') {
+          throw error
+        }
         const jobError = toJobError(error, reduceStep.index)
         await this.finalizeFailed(jobId, jobError)
         throw new JobFailureError(jobError.code, jobError.message, 'failed')
@@ -537,6 +590,7 @@ export class JobEngine {
       }
       throw new JobFailureError('CANCELED', 'job canceled by user', 'canceled')
     }
+    this.assertLockHeld(jobId)
 
     const done: JobRecord = {
       ...working,

@@ -5,6 +5,8 @@ import { Redis } from '@upstash/redis'
 import { isLikelyThinkingModel, resolveCacheIdContext, THINKING_MODEL_MIN_OUTPUT_TOKENS } from '~/lib/models/registry'
 import { getCacheId } from '~/utils/getCacheId'
 import { getUtf8ByteLength } from '~/lib/openai/getSmallSizeTranscripts'
+import { selectApiKeyAndActivatedLicenseKey } from '~/lib/openai/selectApiKeyAndActivatedLicenseKey'
+import type { BuiltSummarizeRequest } from '~/lib/openai/buildSummarizeRequest'
 import { ChatGPTAgent, fetchOpenAIResult, OpenAIStreamPayload } from '~/lib/openai/fetchOpenAIResult'
 import { buildChunkUserPrompt, buildReduceUserPrompt } from '~/lib/jobs/prompts'
 import { JobEngine, JobFailureError, StepRunner } from '~/lib/jobs/engine'
@@ -273,6 +275,53 @@ export async function writeJobResultToCanonicalCache(input: SummaryJobInput, sum
     // 回写失败不影响 job 结果本身，与摘要主链路的缓存语义一致（fail-open）
     console.error('[jobs] canonical cache write failed:', error)
   }
+}
+
+/**
+ * 历史重生成等既有调用方的统一入口：按 plan 自动分流——
+ * fast 走单次 fetchOpenAIResult（与旧链路一致），job 走 map-reduce 管线。
+ * 供 pages/api/history/[id]/regenerate 接线替换「直接用 openAiPayload 调
+ * fetchOpenAIResult」的旧写法（该文件属 KIN-41 文件域，由主会话接线）：
+ * job plan 下 openAiPayload 只含首 chunk，直接调用会静默丢掉其余内容。
+ */
+export async function summarizeFromBuiltRequest(
+  built: BuiltSummarizeRequest,
+  options: { forceNewResult?: boolean; engine?: JobEngine } = {},
+): Promise<{ text: string; jobId: string | null; plan: 'fast' | 'job' }> {
+  const apiKey = await selectApiKeyAndActivatedLicenseKey(built.userKey, built.videoId)
+  if (built.plan === 'fast') {
+    const result = await fetchOpenAIResult(
+      { ...built.openAiPayload, stream: false },
+      apiKey,
+      built.videoConfig,
+      built.baseUrl,
+      built.cacheContext,
+    )
+    return { text: typeof result === 'string' ? result : String(result), jobId: null, plan: 'fast' }
+  }
+  const result = await runSummaryToCompletion(
+    {
+      videoConfig: built.videoConfig,
+      userConfig: { baseUrl: built.baseUrl, userKey: built.userKey, shouldShowTimestamp: built.shouldShowTimestamp },
+      title: built.title,
+      chunks: built.chunks.map(({ index, hash, text, byteLength, startSeconds, endSeconds }) => ({
+        index,
+        hash,
+        text,
+        byteLength,
+        startSeconds,
+        endSeconds,
+      })),
+      model: built.modelTarget.model,
+      provider: built.modelTarget.provider,
+      baseUrl: built.modelTarget.baseUrl,
+      promptVersion: built.cacheContext.promptVersion,
+      detailTokens: built.detailTokens,
+      apiKey,
+    },
+    options,
+  )
+  return { text: result.summaryText, jobId: result.jobId, plan: 'job' }
 }
 
 /**

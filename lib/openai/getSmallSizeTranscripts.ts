@@ -36,11 +36,21 @@ const LIMIT_COUNT = 6200 // 2000 is a buffer
  */
 export const DEFAULT_CHUNK_BYTE_LIMIT = 6000
 /**
- * timestamp 模式预算：getUserSubtitleWithTimestampPrompt 会对文本再
- * JSON.stringify（引号/反斜杠转义膨胀）后才过 6200 限幅；预留 ~13% 编码
- * 开销，保证序列化后仍不触发二次截断。
+ * timestamp 模式预算：getUserSubtitleWithTimestampPrompt 会对 chunk 文本整体
+ * JSON.stringify（ASCII 引号/反斜杠逐字符翻倍）后再过 6200 限幅。该模式下
+ * 装箱按「编码后字节」计权，保证最坏转义情况下序列化结果仍不触发二次截断
+ * （留 200 bytes 裕量覆盖外层引号与分隔符近似误差）。
  */
-export const TIMESTAMP_CHUNK_BYTE_LIMIT = 5200
+export const TIMESTAMP_CHUNK_BYTE_LIMIT = 6000
+
+export interface ChunkOptions {
+  /** true 时装箱与硬切分均按 JSON.stringify 后的字节数计权（timestamp prompt 场景） */
+  encodedWeight?: boolean
+}
+
+function encodedByteLength(text: string) {
+  return getUtf8ByteLength(JSON.stringify(text))
+}
 
 export interface TranscriptChunk {
   index: number
@@ -74,12 +84,12 @@ function stableChunkHash(text: string, startSeconds: number | null, endSeconds: 
  * 单条字幕超过 chunk 预算时按字符边界确定性硬切分（绝不丢弃内容）。
  * 按字符累积，超预算即封口；单个字符超预算（不可能出现）退化为整段输出。
  */
-function splitOversizedItem(text: string, byteLimit: number): string[] {
+function splitOversizedItem(text: string, byteLimit: number, weightOf: (text: string) => number): string[] {
   const pieces: string[] = []
   let current = ''
   let currentBytes = 0
   for (const char of text) {
-    const charBytes = getUtf8ByteLength(char)
+    const charBytes = weightOf(char)
     if (currentBytes > 0 && currentBytes + charBytes > byteLimit) {
       pieces.push(current)
       current = char
@@ -112,10 +122,12 @@ function toSeconds(value: number | string | undefined): number | null {
 export function chunkSubtitles(
   items: Array<Pick<CommonSubtitleItem, 'text' | 'index' | 's'>>,
   byteLimit: number = DEFAULT_CHUNK_BYTE_LIMIT,
+  options: ChunkOptions = {},
 ): TranscriptChunk[] {
   if (!Number.isFinite(byteLimit) || byteLimit <= 0) {
     throw new Error(`byteLimit must be a positive number, got ${byteLimit}`)
   }
+  const weightOf = options.encodedWeight ? encodedByteLength : getUtf8ByteLength
   const sorted = items
     .slice()
     .sort((a, b) => a.index - b.index)
@@ -124,17 +136,21 @@ export function chunkSubtitles(
     return []
   }
 
-  // 展开为不可再分的原子片段：普通 item 原样；超大 item 拆成多段
-  const atoms: Array<{ text: string; itemIndex: number; seconds: number | null }> = []
+  // 展开为不可再分的原子片段：普通 item 原样；超大 item 拆成多段。
+  // spaced 表示该 atom 与前一个 atom 之间是否有 ' ' 分隔——同 item 硬切出的
+  // 相邻 piece 之间不能插入空格，否则原始内容被污染
+  const atoms: Array<{ text: string; itemIndex: number; seconds: number | null; spaced: boolean }> = []
   sorted.forEach((item) => {
     const text = item.text
-    if (getUtf8ByteLength(text) <= byteLimit) {
-      atoms.push({ text, itemIndex: item.index, seconds: toSeconds(item.s) })
+    if (weightOf(text) <= byteLimit) {
+      atoms.push({ text, itemIndex: item.index, seconds: toSeconds(item.s), spaced: true })
       return
     }
-    for (const piece of splitOversizedItem(text, byteLimit)) {
-      atoms.push({ text: piece, itemIndex: item.index, seconds: toSeconds(item.s) })
-    }
+    const pieces = splitOversizedItem(text, byteLimit, weightOf)
+    pieces.forEach((piece, pieceIndex) => {
+      // 同 item 硬切出的后续 piece 与前一 piece 无分隔；新 item 的首 piece 才有 ' '
+      atoms.push({ text: piece, itemIndex: item.index, seconds: toSeconds(item.s), spaced: pieceIndex === 0 })
+    })
   })
 
   const chunks: TranscriptChunk[] = []
@@ -146,9 +162,13 @@ export function chunkSubtitles(
     if (currentTexts.length === 0) {
       return
     }
-    const text = currentTexts.join(' ')
-    const first = atoms[firstAtomIndex]
-    const last = atoms[firstAtomIndex + currentTexts.length - 1]
+    const slice = atoms.slice(firstAtomIndex, firstAtomIndex + currentTexts.length)
+    const text = slice.reduce(
+      (acc, atom, position) => (position === 0 || !atom.spaced ? `${acc}${atom.text}` : `${acc} ${atom.text}`),
+      '',
+    )
+    const first = slice[0]
+    const last = slice[slice.length - 1]
     chunks.push({
       index: chunks.length,
       hash: stableChunkHash(text, first.seconds, last.seconds),
@@ -165,9 +185,9 @@ export function chunkSubtitles(
   }
 
   for (const atom of atoms) {
-    const atomBytes = getUtf8ByteLength(atom.text)
-    const separatorBytes = currentTexts.length > 0 ? 1 : 0
-    if (currentBytes > 0 && currentBytes + separatorBytes + atomBytes > byteLimit) {
+    const atomBytes = weightOf(atom.text)
+    const separatorBytes = currentTexts.length > 0 && atom.spaced ? 1 : 0
+    if (currentTexts.length > 0 && currentBytes + separatorBytes + atomBytes > byteLimit) {
       flush()
       currentTexts.push(atom.text)
       currentBytes = atomBytes
