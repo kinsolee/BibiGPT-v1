@@ -42,15 +42,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     // only when explicitly overridden via MODEL_CATALOG_API_KEY, or when the
     // catalog endpoint shares the provider's origin (e.g. Zhipu /models).
     const catalogApiKey = process.env.MODEL_CATALOG_API_KEY?.trim()
+    const providerApiKey = process.env.OPENAI_COMPATIBLE_API_KEY || process.env.OPENAI_API_KEY
     const providerBaseUrl = process.env.OPENAI_COMPATIBLE_BASE_URL?.trim()
     if (catalogApiKey) {
       headers.Authorization = `Bearer ${catalogApiKey}`
-    } else if (
-      process.env.OPENAI_COMPATIBLE_API_KEY &&
-      providerBaseUrl &&
-      originOf(catalogUrl) === originOf(providerBaseUrl)
-    ) {
-      headers.Authorization = `Bearer ${process.env.OPENAI_COMPATIBLE_API_KEY}`
+    } else if (providerApiKey && providerBaseUrl && originOf(catalogUrl) === originOf(providerBaseUrl)) {
+      headers.Authorization = `Bearer ${providerApiKey}`
     }
     const response = await fetch(catalogUrl, {
       signal: AbortSignal.timeout(CATALOG_TIMEOUT_MS),
