@@ -2,8 +2,8 @@ import { useUser } from '@supabase/auth-helpers-react'
 import Link from 'next/link'
 import { useEffect, useState } from 'react'
 import { Sidebar } from '~/components/sidebar'
-import { fetchHistoryList, HistoryApiError } from '~/hooks/useHistory'
-import { HistoryListItemDTO } from '~/lib/history/types'
+import { fetchHistoryList, fetchHistoryStats, HistoryApiError } from '~/hooks/useHistory'
+import { HistoryListItemDTO, HistoryStatsDTO } from '~/lib/history/types'
 
 function formatDate(value: string | null) {
   if (!value) {
@@ -15,26 +15,23 @@ function formatDate(value: string | null) {
 export default function DashboardPage() {
   const user = useUser()
   const [items, setItems] = useState<HistoryListItemDTO[]>([])
-  const [total, setTotal] = useState(0)
+  const [stats, setStats] = useState<HistoryStatsDTO | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
     if (!user) {
       return
     }
-    fetchHistoryList({ pageSize: 100 })
-      .then((result) => {
-        setItems(result.items)
-        setTotal(result.total)
+    // 统计走 /api/history/stats（全量计数），最近列表只需第一页
+    Promise.all([fetchHistoryStats(), fetchHistoryList({ pageSize: 5 })])
+      .then(([statsResult, listResult]) => {
+        setStats(statsResult)
+        setItems(listResult.items)
       })
       .catch((e) => {
         setError(e instanceof HistoryApiError && e.status === 401 ? '请先登录后查看仪表盘' : (e as Error).message)
       })
   }, [user])
-
-  const favoriteCount = items.filter((item) => item.isFavorite).length
-  const serviceCount = new Set(items.map((item) => item.service)).size
-  const recent = items.slice(0, 5)
 
   return (
     <>
@@ -50,15 +47,15 @@ export default function DashboardPage() {
           <>
             <div className="mb-8 grid grid-cols-1 gap-4 sm:grid-cols-3">
               <div className="rounded-xl border border-slate-200 p-4 dark:border-slate-700">
-                <div className="text-3xl font-bold">{total}</div>
+                <div className="text-3xl font-bold">{stats?.total ?? '…'}</div>
                 <div className="text-sm text-slate-500 dark:text-slate-400">已总结视频</div>
               </div>
               <div className="rounded-xl border border-slate-200 p-4 dark:border-slate-700">
-                <div className="text-3xl font-bold">{favoriteCount}</div>
+                <div className="text-3xl font-bold">{stats?.favorites ?? '…'}</div>
                 <div className="text-sm text-slate-500 dark:text-slate-400">收藏</div>
               </div>
               <div className="rounded-xl border border-slate-200 p-4 dark:border-slate-700">
-                <div className="text-3xl font-bold">{serviceCount}</div>
+                <div className="text-3xl font-bold">{stats?.services ?? '…'}</div>
                 <div className="text-sm text-slate-500 dark:text-slate-400">内容来源数</div>
               </div>
             </div>
@@ -69,11 +66,11 @@ export default function DashboardPage() {
                 查看全部 →
               </Link>
             </div>
-            {recent.length === 0 ? (
+            {items.length === 0 ? (
               <p className="mt-3 text-slate-500">暂无历史记录，去首页总结一个视频吧。</p>
             ) : (
               <ul className="mt-3 space-y-2">
-                {recent.map((item) => (
+                {items.map((item) => (
                   <li key={item.id} className="rounded-xl border border-slate-200 p-3 dark:border-slate-700">
                     <Link
                       href={`/user/videos/${item.id}`}

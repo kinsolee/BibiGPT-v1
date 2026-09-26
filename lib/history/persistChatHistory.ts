@@ -39,6 +39,8 @@ type PersistChatHistoryParams = {
     showTimestamp?: boolean
     [key: string]: unknown
   }
+  /** 摘要请求实际使用的 timestamp 选项（userConfig.shouldShowTimestamp），优先于 videoConfig.showTimestamp */
+  shouldShowTimestamp?: boolean
   videoId: string
   title: string | null
   subtitlesArray: Array<CommonSubtitleItem> | null
@@ -53,7 +55,17 @@ type PersistChatHistoryParams = {
  * 落库失败只记日志，绝不影响摘要响应。
  */
 export async function persistChatHistory(params: PersistChatHistoryParams) {
-  const { historyUser, videoConfig, videoId, title, subtitlesArray, descriptionText, model, summaryText } = params
+  const {
+    historyUser,
+    videoConfig,
+    shouldShowTimestamp,
+    videoId,
+    title,
+    subtitlesArray,
+    descriptionText,
+    model,
+    summaryText,
+  } = params
   if (!historyUser) {
     return
   }
@@ -61,7 +73,10 @@ export async function persistChatHistory(params: PersistChatHistoryParams) {
     return
   }
   try {
-    const segments = subtitlesArray ? commonSubtitlesToSegments(subtitlesArray, videoConfig.showTimestamp) : []
+    // 摘要链路实际生效的是 userConfig.shouldShowTimestamp；落库的配置快照与转录清洗必须与之保持一致，
+    // 否则重新生成时会用错选项
+    const effectiveShowTimestamp = shouldShowTimestamp ?? Boolean(videoConfig.showTimestamp)
+    const segments = subtitlesArray ? commonSubtitlesToSegments(subtitlesArray, effectiveShowTimestamp) : []
     const result = await persistSummarizedContent({
       supabase: historyUser.supabase,
       userId: historyUser.userId,
@@ -76,7 +91,7 @@ export async function persistChatHistory(params: PersistChatHistoryParams) {
       },
       segments,
       transcriptFullText: subtitlesArray ? null : descriptionText ?? null,
-      config: toSummaryConfigSnapshot(videoConfig),
+      config: { ...toSummaryConfigSnapshot(videoConfig), showTimestamp: effectiveShowTimestamp },
       model: model ?? null,
       summaryText,
     })

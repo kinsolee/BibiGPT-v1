@@ -1,4 +1,4 @@
-import { HistoryDetailDTO, HistoryListResponse } from '~/lib/history/types'
+import { HistoryDetailDTO, HistoryListResponse, HistoryStatsDTO } from '~/lib/history/types'
 
 export class HistoryApiError extends Error {
   status: number
@@ -48,8 +48,13 @@ export function fetchHistoryList(query: HistoryListQuery = {}) {
   return requestJson<HistoryListResponse>(`/api/history${qs ? `?${qs}` : ''}`)
 }
 
-export function fetchHistoryDetail(id: string) {
-  return requestJson<HistoryDetailDTO>(`/api/history/${id}`)
+export function fetchHistoryDetail(id: string, summaryId?: string | null) {
+  const qs = summaryId ? `?summaryId=${encodeURIComponent(summaryId)}` : ''
+  return requestJson<HistoryDetailDTO>(`/api/history/${id}${qs}`)
+}
+
+export function fetchHistoryStats() {
+  return requestJson<HistoryStatsDTO>('/api/history/stats')
 }
 
 export function deleteHistoryItem(id: string) {

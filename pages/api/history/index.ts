@@ -35,6 +35,30 @@ async function pickLatestSummaries(supabase: SupabaseClient, contentIds: string[
   return latest
 }
 
+/** 分页收集所有摘要正文命中的 content_id；硬上限仅为防御异常数据，正常历史规模远达不到 */
+async function collectSummaryHitIds(supabase: SupabaseClient, search: string) {
+  const ids = new Set<string>()
+  const PAGE_SIZE = 1000
+  const MAX_ROWS = 100000
+  for (let from = 0; from < MAX_ROWS; from += PAGE_SIZE) {
+    const page = await supabase
+      .from('summaries')
+      .select('content_id')
+      .ilike('content_text', `%${search}%`)
+      .range(from, from + PAGE_SIZE - 1)
+    if (page.error) {
+      throw page.error
+    }
+    for (const row of (page.data ?? []) as Array<{ content_id: string }>) {
+      ids.add(row.content_id)
+    }
+    if ((page.data ?? []).length < PAGE_SIZE) {
+      break
+    }
+  }
+  return ids
+}
+
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== 'GET') {
     res.setHeader('Allow', 'GET')
@@ -63,17 +87,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     }
     if (search) {
       // 搜索命中：标题 / source_ref / source_url / 任意版本的摘要正文
-      const summaryHits = await auth.supabase
-        .from('summaries')
-        .select('content_id')
-        .ilike('content_text', `%${search}%`)
-        .limit(500)
-      if (summaryHits.error) {
-        throw summaryHits.error
-      }
-      const hitIds = Array.from(
-        new Set(((summaryHits.data ?? []) as Array<{ content_id: string }>).map((r) => r.content_id)),
-      )
+      const hitIds = Array.from(await collectSummaryHitIds(auth.supabase, search))
       const escaped = search.replace(/,/g, '')
       const orParts = [
         `title.ilike.%${escaped}%`,

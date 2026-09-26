@@ -166,6 +166,8 @@ create index if not exists highlights_content_idx on public.highlights (content_
 create index if not exists collections_user_idx on public.collections (user_id);
 create index if not exists collection_items_collection_idx on public.collection_items (collection_id);
 create index if not exists collection_items_content_idx on public.collection_items (content_id);
+-- 并发分配 version 的兜底：同内容下 version 必须唯一（应用层冲突后重读重试）
+create unique index if not exists summaries_content_version_uidx on public.summaries (content_id, version);
 
 -- ============================================================ grants
 grant usage on schema public to authenticated;
@@ -185,22 +187,14 @@ alter table public.collection_items enable row level security;
 
 -- 自用版策略：登录用户只能读写 user_id = auth.uid() 的行；匿名（anon role）无任何权限，
 -- 未登录摘要继续走既有 Redis 临时缓存，不落库。
+-- 顶层表（contents / collections）只校验自身 user_id；
+-- 子表必须同时校验被引用父行（contents/transcripts/summaries/collections）属于同一用户，
+-- 防止把行挂到他人 content/transcript/summary 上注入数据。
 do $$
 declare
   t text;
 begin
-  foreach t in array array[
-    'contents',
-    'media_assets',
-    'transcripts',
-    'transcript_segments',
-    'summaries',
-    'artifacts',
-    'chapters',
-    'highlights',
-    'collections',
-    'collection_items'
-  ]
+  foreach t in array array['contents', 'collections']
   loop
     execute format('drop policy if exists "%s_owner_all" on public.%I', t, t);
     execute format(
@@ -209,5 +203,101 @@ begin
       t
     );
   end loop;
+
+  -- 父行为 contents 的子表：media_assets / transcripts / summaries
+  foreach t in array array['media_assets', 'transcripts', 'summaries']
+  loop
+    execute format('drop policy if exists "%s_owner_all" on public.%I', t, t);
+    execute format(
+      'create policy "%s_owner_all" on public.%I for all to authenticated
+         using (
+           auth.uid() = user_id
+           and exists (select 1 from public.contents c where c.id = %I.content_id and c.user_id = auth.uid())
+         )
+         with check (
+           auth.uid() = user_id
+           and exists (select 1 from public.contents c where c.id = %I.content_id and c.user_id = auth.uid())
+         )',
+      t,
+      t,
+      t,
+      t
+    );
+  end loop;
+
+  -- 父行为 contents + 可空 summaries 的子表：artifacts / chapters / highlights
+  foreach t in array array['artifacts', 'chapters', 'highlights']
+  loop
+    execute format('drop policy if exists "%s_owner_all" on public.%I', t, t);
+    execute format(
+      'create policy "%s_owner_all" on public.%I for all to authenticated
+         using (
+           auth.uid() = user_id
+           and exists (select 1 from public.contents c where c.id = %I.content_id and c.user_id = auth.uid())
+           and (
+             summary_id is null
+             or exists (select 1 from public.summaries s where s.id = %I.summary_id and s.user_id = auth.uid())
+           )
+         )
+         with check (
+           auth.uid() = user_id
+           and exists (select 1 from public.contents c where c.id = %I.content_id and c.user_id = auth.uid())
+           and (
+             summary_id is null
+             or exists (select 1 from public.summaries s where s.id = %I.summary_id and s.user_id = auth.uid())
+           )
+         )',
+      t,
+      t,
+      t,
+      t,
+      t,
+      t
+    );
+  end loop;
 end
 $$;
+
+-- transcript_segments：父行为 transcripts
+drop policy if exists "transcript_segments_owner_all" on public.transcript_segments;
+create policy "transcript_segments_owner_all" on public.transcript_segments for all to authenticated
+  using (
+    auth.uid() = user_id
+    and exists (
+      select 1 from public.transcripts tr
+      where tr.id = transcript_segments.transcript_id and tr.user_id = auth.uid()
+    )
+  )
+  with check (
+    auth.uid() = user_id
+    and exists (
+      select 1 from public.transcripts tr
+      where tr.id = transcript_segments.transcript_id and tr.user_id = auth.uid()
+    )
+  );
+
+-- collection_items：父行为 collections + contents
+drop policy if exists "collection_items_owner_all" on public.collection_items;
+create policy "collection_items_owner_all" on public.collection_items for all to authenticated
+  using (
+    auth.uid() = user_id
+    and exists (
+      select 1 from public.collections col
+      where col.id = collection_items.collection_id and col.user_id = auth.uid()
+    )
+    and exists (
+      select 1 from public.contents c
+      where c.id = collection_items.content_id and c.user_id = auth.uid()
+    )
+  )
+  with check (
+    auth.uid() = user_id
+    and exists (
+      select 1 from public.collections col
+      where col.id = collection_items.collection_id and col.user_id = auth.uid()
+    )
+    and exists (
+      select 1 from public.contents c
+      where c.id = collection_items.content_id and c.user_id = auth.uid()
+    )
+  );

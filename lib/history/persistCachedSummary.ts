@@ -34,14 +34,15 @@ export async function persistCachedSummary(params: CachedSummaryParams): Promise
   const snapshot = toSummaryConfigSnapshot(videoConfig)
   const snapshotKey = stableStringify(snapshot)
 
-  const existingContent = await supabase
+  let contentMatch = supabase
     .from('contents')
     .select('id')
     .eq('user_id', userId)
     .eq('service', service)
     .eq('source_ref', videoConfig.videoId)
-    .is('source_page', sourcePage)
-    .maybeSingle()
+  // PostgREST 的 is 过滤仅用于 NULL；非空 source_page 必须等值匹配
+  contentMatch = sourcePage === null ? contentMatch.is('source_page', null) : contentMatch.eq('source_page', sourcePage)
+  const existingContent = await contentMatch.maybeSingle()
   if (existingContent.error) {
     throw existingContent.error
   }
@@ -67,29 +68,36 @@ export async function persistCachedSummary(params: CachedSummaryParams): Promise
     contentId = inserted.data.id
   }
 
-  const summaries = await supabase.from('summaries').select('*').eq('content_id', contentId)
-  if (summaries.error) {
-    throw summaries.error
-  }
-  const rows = (summaries.data ?? []) as SummaryRow[]
-  if (rows.some((row) => stableStringify(row.config) === snapshotKey)) {
-    return
-  }
+  // 唯一索引 (content_id, version) 兜底下，读-算-插的并发冲突以重读重试解决
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const summaries = await supabase.from('summaries').select('*').eq('content_id', contentId)
+    if (summaries.error) {
+      throw summaries.error
+    }
+    const rows = (summaries.data ?? []) as SummaryRow[]
+    if (rows.some((row) => stableStringify(row.config) === snapshotKey)) {
+      return
+    }
 
-  const nextVersion = rows.reduce((max, row) => Math.max(max, row.version), 0) + 1
-  const { error } = await supabase.from('summaries').insert({
-    user_id: userId,
-    content_id: contentId,
-    transcript_id: null,
-    config: snapshot,
-    model: typeof videoConfig.model === 'string' ? videoConfig.model : null,
-    prompt_version: PROMPT_VERSION,
-    status: 'completed',
-    input_hash: await sha256Hex(`cache:${cacheId}`),
-    version: nextVersion,
-    content_text: summaryText,
-  })
-  if (error && error.code !== '23505') {
-    throw error
+    const { error } = await supabase.from('summaries').insert({
+      user_id: userId,
+      content_id: contentId,
+      transcript_id: null,
+      config: snapshot,
+      model: typeof videoConfig.model === 'string' ? videoConfig.model : null,
+      prompt_version: PROMPT_VERSION,
+      status: 'completed',
+      input_hash: await sha256Hex(`cache:${cacheId}`),
+      version: rows.reduce((max, row) => Math.max(max, row.version), 0) + 1,
+      content_text: summaryText,
+    })
+    if (!error) {
+      return
+    }
+    if (error.code !== '23505') {
+      throw error
+    }
+    // 冲突来源二选一：配置快照已存在（循环顶部会命中返回）或 version 并发竞争——重读后重试
   }
+  throw new Error('cached summary version allocation failed after retries')
 }

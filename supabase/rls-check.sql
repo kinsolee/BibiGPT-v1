@@ -58,3 +58,18 @@ set role anon;
 select count(*) as anon_visible_rows from public.contents;
 -- 期望：anon_visible_rows = 0
 reset role;
+
+-- 7. 跨父行注入必须被拒绝：以 USER_A 身份插入 content 后，
+--    以 USER_B 身份把 transcript 挂到 USER_A 的 content 上，应报 RLS 错误。
+begin;
+set local role authenticated;
+select set_config('request.jwt.claims', '{"sub":"USER_A","role":"authenticated"}', true);
+insert into public.contents (user_id, source_url, service, source_ref)
+values ('USER_A', 'https://www.youtube.com/watch?v=rls_check2', 'youtube', 'rls_check2');
+
+select set_config('request.jwt.claims', '{"sub":"USER_B","role":"authenticated"}', true);
+insert into public.transcripts (user_id, content_id, input_hash)
+values ('USER_B', (select id from public.contents where source_ref = 'rls_check2'), 'hash_check2');
+-- 期望：ERROR: new row violates row-level security policy for table "transcripts"
+
+rollback;

@@ -39,6 +39,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const persistParams = {
       historyUser,
       videoConfig,
+      shouldShowTimestamp: userConfig?.shouldShowTimestamp,
       videoId,
       title,
       subtitlesArray,

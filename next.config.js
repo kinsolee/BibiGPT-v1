@@ -28,21 +28,24 @@ const nextConfig = {
     ],
   },
   async rewrites() {
-    const rewrites = [
+    // afterFiles rewrite 优先于动态路由匹配：若这里保留 /api/:path* 通配，
+    // 本地 /api/history/[id] 等动态 API 路由会被整体劫持到外部主机。
+    // 仓库内唯一无本地路由文件、需要内部服务代理的端点是 /api/b23tv（见 pages/[...slug].tsx）；
+    // 内部服务新增端点时需在此显式追加。未配置或非完整 URL（裸 hostname）时跳过，避免 build 校验失败。
+    const internalApiHostname = process.env.INTERNAL_API_HOSTNAME || ''
+    if (!/^https?:\/\//.test(internalApiHostname)) {
+      return [{ source: '/blocked', destination: '/shop' }]
+    }
+    return [
+      {
+        source: '/api/b23tv',
+        destination: `${internalApiHostname}/api/b23tv`,
+      },
       {
         source: '/blocked',
         destination: '/shop',
       },
     ]
-    // 未配置或非完整 URL（如裸 hostname）时跳过该 rewrite，避免 next build 校验失败
-    const internalApiHostname = process.env.INTERNAL_API_HOSTNAME || ''
-    if (/^https?:\/\//.test(internalApiHostname)) {
-      rewrites.unshift({
-        source: '/api/:path*',
-        destination: `${internalApiHostname}/api/:path*`,
-      })
-    }
-    return rewrites
   },
 }
 

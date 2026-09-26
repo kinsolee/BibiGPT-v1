@@ -8,6 +8,7 @@ export function toSummaryDTO(row: SummaryRow): HistorySummaryDTO {
     model: row.model,
     status: row.status,
     contentText: row.content_text,
+    transcriptId: row.transcript_id,
     createdAt: row.created_at,
   }
 }

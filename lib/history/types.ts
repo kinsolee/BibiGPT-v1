@@ -122,6 +122,7 @@ export type HistorySummaryDTO = {
   model: string | null
   status: string
   contentText: string | null
+  transcriptId: string | null
   createdAt: string
 }
 
@@ -137,6 +138,12 @@ export type HistoryListItemDTO = {
   createdAt: string
   lastSummarizedAt: string | null
   summary: HistorySummaryDTO | null
+}
+
+export type HistoryStatsDTO = {
+  total: number
+  favorites: number
+  services: number
 }
 
 export type HistoryListResponse = {

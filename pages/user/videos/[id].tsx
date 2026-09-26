@@ -35,23 +35,31 @@ export default function HistoryDetailPage() {
   const [error, setError] = useState<string | null>(null)
   const [regenerating, setRegenerating] = useState(false)
 
-  const load = useCallback(async () => {
-    if (typeof id !== 'string' || !id) {
-      return
-    }
-    setLoading(true)
-    setError(null)
-    try {
-      const result = await fetchHistoryDetail(id)
-      setDetail(result)
-      setSelectedVersion(result.summaries[0]?.version ?? null)
-    } catch (e) {
-      setError(e instanceof HistoryApiError && e.status === 401 ? '请先登录后查看历史记录' : (e as Error).message)
-      setDetail(null)
-    } finally {
-      setLoading(false)
-    }
-  }, [id])
+  const load = useCallback(
+    async (summaryId?: string | null, options?: { silent?: boolean }) => {
+      if (typeof id !== 'string' || !id) {
+        return
+      }
+      if (!options?.silent) {
+        setLoading(true)
+        setError(null)
+      }
+      try {
+        // 传 summaryId 时服务端返回该版本的摘要与对应 transcript（不传则默认最新版本）
+        const result = await fetchHistoryDetail(id, summaryId ?? undefined)
+        setDetail(result)
+        setSelectedVersion(result.content.summary?.version ?? null)
+      } catch (e) {
+        setError(e instanceof HistoryApiError && e.status === 401 ? '请先登录后查看历史记录' : (e as Error).message)
+        setDetail(null)
+      } finally {
+        if (!options?.silent) {
+          setLoading(false)
+        }
+      }
+    },
+    [id],
+  )
 
   useEffect(() => {
     if (user && router.isReady) {
@@ -61,6 +69,11 @@ export default function HistoryDetailPage() {
 
   const selectedSummary =
     detail?.summaries.find((summary) => summary.version === selectedVersion) ?? detail?.summaries[0] ?? null
+
+  const switchVersion = (summaryId: string, version: number) => {
+    setSelectedVersion(version)
+    load(summaryId, { silent: true })
+  }
 
   const handleRegenerate = async () => {
     if (!detail || regenerating) {
@@ -169,7 +182,7 @@ export default function HistoryDetailPage() {
                   <button
                     key={summary.id}
                     type="button"
-                    onClick={() => setSelectedVersion(summary.version)}
+                    onClick={() => switchVersion(summary.id, summary.version)}
                     className={`rounded-lg border px-2.5 py-1 ${
                       summary.version === selectedVersion
                         ? 'border-pink-500 text-pink-600 dark:text-pink-400'

@@ -13,7 +13,11 @@ import {
   TranscriptSegmentRow,
 } from '~/lib/history/types'
 
-async function loadDetail(supabase: SupabaseClient, id: string): Promise<HistoryDetailDTO | null> {
+async function loadDetail(
+  supabase: SupabaseClient,
+  id: string,
+  requestedSummaryId: string | null,
+): Promise<HistoryDetailDTO | null> {
   const content = await supabase.from('contents').select('*').eq('id', id).maybeSingle()
   if (content.error) {
     throw content.error
@@ -32,41 +36,51 @@ async function loadDetail(supabase: SupabaseClient, id: string): Promise<History
     throw summaries.error
   }
   const summaryRows = (summaries.data ?? []) as SummaryRow[]
-
-  const latestTranscript = await supabase
-    .from('transcripts')
-    .select('*')
-    .eq('content_id', id)
-    .order('created_at', { ascending: false })
-    .limit(1)
-  if (latestTranscript.error) {
-    throw latestTranscript.error
+  const selectedSummary = requestedSummaryId
+    ? summaryRows.find((row) => row.id === requestedSummaryId)
+    : summaryRows[0] ?? null
+  if (requestedSummaryId && !selectedSummary) {
+    return null
   }
-  const transcriptRow = ((latestTranscript.data ?? [])[0] ?? null) as TranscriptRow | null
+
+  // transcript 严格跟随所选 summary 的 transcript_id；
+  // 缓存渐进导入的 summary 无 transcript_id（无存储源数据），此时不返回 transcript，
+  // 避免展示与该版本输入不一致的转录
   let transcript: HistoryDetailDTO['transcript'] = null
-  if (transcriptRow) {
-    const segments = await supabase
-      .from('transcript_segments')
-      .select('id, transcript_id, idx, start, end, text, lang, speaker, source_ref')
-      .eq('transcript_id', transcriptRow.id)
-      .order('idx', { ascending: true })
-    if (segments.error) {
-      throw segments.error
+  if (selectedSummary?.transcript_id) {
+    const transcriptRowResult = await supabase
+      .from('transcripts')
+      .select('*')
+      .eq('id', selectedSummary.transcript_id)
+      .maybeSingle()
+    if (transcriptRowResult.error) {
+      throw transcriptRowResult.error
     }
-    const segmentRows = (segments.data ?? []) as TranscriptSegmentRow[]
-    transcript = {
-      id: transcriptRow.id,
-      lang: transcriptRow.lang,
-      fullText: transcriptRow.full_text,
-      segmentCount: transcriptRow.segment_count,
-      createdAt: transcriptRow.created_at,
-      segments: segmentRows.map((segment) => ({
-        idx: segment.idx,
-        start: segment.start,
-        end: segment.end,
-        text: segment.text,
-        speaker: segment.speaker,
-      })),
+    const transcriptRow = transcriptRowResult.data as TranscriptRow | null
+    if (transcriptRow) {
+      const segments = await supabase
+        .from('transcript_segments')
+        .select('id, transcript_id, idx, start, end, text, lang, speaker, source_ref')
+        .eq('transcript_id', transcriptRow.id)
+        .order('idx', { ascending: true })
+      if (segments.error) {
+        throw segments.error
+      }
+      const segmentRows = (segments.data ?? []) as TranscriptSegmentRow[]
+      transcript = {
+        id: transcriptRow.id,
+        lang: transcriptRow.lang,
+        fullText: transcriptRow.full_text,
+        segmentCount: transcriptRow.segment_count,
+        createdAt: transcriptRow.created_at,
+        segments: segmentRows.map((segment) => ({
+          idx: segment.idx,
+          start: segment.start,
+          end: segment.end,
+          text: segment.text,
+          speaker: segment.speaker,
+        })),
+      }
     }
   }
 
@@ -92,7 +106,7 @@ async function loadDetail(supabase: SupabaseClient, id: string): Promise<History
   }
 
   return {
-    content: toListItem(contentRow, summaryRows[0] ?? null),
+    content: toListItem(contentRow, selectedSummary ?? null),
     summaries: summaryRows.map(toSummaryDTO),
     transcript,
     chapters: ((chapters.data ?? []) as ChapterRow[]).map((chapter) => ({
@@ -132,7 +146,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
   try {
     if (req.method === 'GET') {
-      const detail = await loadDetail(auth.supabase, id)
+      const requestedSummaryId =
+        typeof req.query.summaryId === 'string' && req.query.summaryId ? req.query.summaryId : null
+      const detail = await loadDetail(auth.supabase, id, requestedSummaryId)
       if (!detail) {
         return res.status(404).json({ error: 'not_found' })
       }

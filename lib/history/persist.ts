@@ -43,21 +43,25 @@ export type PersistResult = {
   reused: boolean
 }
 
+async function findContentId(supabase: SupabaseClient, userId: string, media: MediaDocumentMetadata) {
+  let match = supabase
+    .from('contents')
+    .select('id')
+    .eq('user_id', userId)
+    .eq('service', media.service)
+    .eq('source_ref', media.sourceRef)
+  // PostgREST 的 is 过滤仅用于 NULL；非空 source_page 必须等值匹配
+  match = media.sourcePage === null ? match.is('source_page', null) : match.eq('source_page', media.sourcePage)
+  return match.maybeSingle()
+}
+
 async function upsertContent(
   supabase: SupabaseClient,
   userId: string,
   media: MediaDocumentMetadata,
   sourceMetadata: Record<string, unknown>,
 ): Promise<string> {
-  const match = supabase
-    .from('contents')
-    .select('id')
-    .eq('user_id', userId)
-    .eq('service', media.service)
-    .eq('source_ref', media.sourceRef)
-    .is('source_page', media.sourcePage)
-    .maybeSingle()
-  const existing = await match
+  const existing = await findContentId(supabase, userId, media)
   if (existing.error) {
     throw existing.error
   }
@@ -100,16 +104,9 @@ async function upsertContent(
   if (inserted.error) {
     // 并发下唯一约束冲突时回退为读取已存在行
     if (inserted.error.code === '23505') {
-      const again = await supabase
-        .from('contents')
-        .select('id')
-        .eq('user_id', userId)
-        .eq('service', media.service)
-        .eq('source_ref', media.sourceRef)
-        .is('source_page', media.sourcePage)
-        .single()
-      if (again.error) {
-        throw again.error
+      const again = await findContentId(supabase, userId, media)
+      if (again.error || !again.data) {
+        throw again.error ?? new Error('content upsert conflict but row not found')
       }
       return again.data.id
     }
@@ -183,14 +180,20 @@ async function upsertTranscript(
     speaker: segment.speaker ?? null,
     source_ref: segment.sourceRef ?? null,
   }))
-  // 分批写入，避免单条 SQL 过大
+  // 分批写入，避免单条 SQL 过大；任一批失败则删除 transcript 行（级联清除已写 segments），
+  // 保证不留半截数据，重试可完整重建
   const CHUNK_SIZE = 500
-  for (let i = 0; i < rows.length; i += CHUNK_SIZE) {
-    const chunk = rows.slice(i, i + CHUNK_SIZE)
-    const { error } = await supabase.from('transcript_segments').insert(chunk)
-    if (error) {
-      throw error
+  try {
+    for (let i = 0; i < rows.length; i += CHUNK_SIZE) {
+      const chunk = rows.slice(i, i + CHUNK_SIZE)
+      const { error } = await supabase.from('transcript_segments').insert(chunk)
+      if (error) {
+        throw error
+      }
     }
+  } catch (segmentError) {
+    await supabase.from('transcripts').delete().eq('id', transcriptId)
+    throw segmentError
   }
   return transcriptId
 }
@@ -217,67 +220,62 @@ export async function persistSummarizedContent(params: PersistSummarizedContentP
   )
 
   const summaryHash = await hashSummaryInput(transcriptHash, config, model)
-  const existingSummary = await supabase
-    .from('summaries')
-    .select('id, version')
-    .eq('content_id', contentId)
-    .eq('input_hash', summaryHash)
-    .maybeSingle()
-  if (existingSummary.error) {
-    throw existingSummary.error
-  }
-  if (existingSummary.data) {
-    return { contentId, summaryId: existingSummary.data.id, version: existingSummary.data.version, reused: true }
-  }
 
-  const maxVersion = await supabase
-    .from('summaries')
-    .select('version')
-    .eq('content_id', contentId)
-    .order('version', { ascending: false })
-    .limit(1)
-    .maybeSingle()
-  if (maxVersion.error) {
-    throw maxVersion.error
-  }
-  const nextVersion = (maxVersion.data?.version ?? 0) + 1
-
-  const insertedSummary = await supabase
-    .from('summaries')
-    .insert({
-      user_id: userId,
-      content_id: contentId,
-      transcript_id: transcriptId,
-      config,
-      model: model ?? null,
-      prompt_version: PROMPT_VERSION,
-      status: 'completed',
-      input_hash: summaryHash,
-      version: nextVersion,
-      content_text: summaryText,
-    })
-    .select('id, version')
-    .single()
-  if (insertedSummary.error) {
-    if (insertedSummary.error.code === '23505') {
-      const again = await supabase
-        .from('summaries')
-        .select('id, version')
-        .eq('content_id', contentId)
-        .eq('input_hash', summaryHash)
-        .single()
-      if (again.error) {
-        throw again.error
-      }
-      return { contentId, summaryId: again.data.id, version: again.data.version, reused: true }
+  // 唯一索引 (content_id, version) 兜底下，读-算-插的并发冲突以重读重试解决
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const existingSummary = await supabase
+      .from('summaries')
+      .select('id, version')
+      .eq('content_id', contentId)
+      .eq('input_hash', summaryHash)
+      .maybeSingle()
+    if (existingSummary.error) {
+      throw existingSummary.error
     }
-    throw insertedSummary.error
+    if (existingSummary.data) {
+      return { contentId, summaryId: existingSummary.data.id, version: existingSummary.data.version, reused: true }
+    }
+
+    const maxVersion = await supabase
+      .from('summaries')
+      .select('version')
+      .eq('content_id', contentId)
+      .order('version', { ascending: false })
+      .limit(1)
+      .maybeSingle()
+    if (maxVersion.error) {
+      throw maxVersion.error
+    }
+
+    const insertedSummary = await supabase
+      .from('summaries')
+      .insert({
+        user_id: userId,
+        content_id: contentId,
+        transcript_id: transcriptId,
+        config,
+        model: model ?? null,
+        prompt_version: PROMPT_VERSION,
+        status: 'completed',
+        input_hash: summaryHash,
+        version: (maxVersion.data?.version ?? 0) + 1,
+        content_text: summaryText,
+      })
+      .select('id, version')
+      .single()
+    if (!insertedSummary.error) {
+      await supabase
+        .from('contents')
+        .update({ last_summarized_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+        .eq('id', contentId)
+
+      return { contentId, summaryId: insertedSummary.data.id, version: insertedSummary.data.version, reused: false }
+    }
+    if (insertedSummary.error.code !== '23505') {
+      throw insertedSummary.error
+    }
+    // 冲突来源二选一：(content_id, input_hash) 幂等命中——循环顶部的查询会命中并返回；
+    // (content_id, version) 并发竞争——重读 max version 后重试
   }
-
-  await supabase
-    .from('contents')
-    .update({ last_summarized_at: new Date().toISOString(), updated_at: new Date().toISOString() })
-    .eq('id', contentId)
-
-  return { contentId, summaryId: insertedSummary.data.id, version: insertedSummary.data.version, reused: false }
+  throw new Error('summary version allocation failed after retries')
 }
