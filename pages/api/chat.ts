@@ -1,11 +1,15 @@
 import type { NextApiRequest, NextApiResponse } from 'next'
-import { buildSummarizeOpenAIPayload, SummarizeRequestError } from '~/lib/openai/buildSummarizeRequest'
+import { buildSummarizeOpenAIPayload, SummarizeRequestError, toJobChunkSpecs } from '~/lib/openai/buildSummarizeRequest'
 import { fetchOpenAIResult } from '~/lib/openai/fetchOpenAIResult'
 import { selectApiKeyAndActivatedLicenseKey } from '~/lib/openai/selectApiKeyAndActivatedLicenseKey'
 import { classifyUpstreamError } from '~/lib/models/errors'
 import { SummarizeParams } from '~/lib/types'
 import { persistChatHistory, resolveHistoryUser } from '~/lib/history/persistChatHistory'
 import { writeWebStreamToNodeResponse } from '~/lib/openai/writeWebStreamToNodeResponse'
+import { JobFailureError } from '~/lib/jobs/engine'
+import { jobErrorToHttpStatus } from '~/lib/jobs/errors'
+import { runSummaryToCompletion } from '~/lib/jobs/summaryJob'
+import { isValidSummaryText } from '~/lib/jobs/validation'
 
 if (!process.env.OPENAI_API_KEY && !process.env.OPENAI_COMPATIBLE_API_KEY) {
   throw new Error('Missing env var for OpenAI-compatible provider API key')
@@ -17,6 +21,16 @@ type ChatBody = Partial<SummarizeParams> & {
 
 function toHttpErrorMessage(statusCode: number, message: string) {
   return `${statusCode}::${message}`
+}
+
+function summaryTextToStream(text: string): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder()
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode(text))
+      controller.close()
+    },
+  })
 }
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -31,8 +45,59 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   }
 
   try {
-    const { openAiPayload, userKey, baseUrl, cacheContext, videoId, title, subtitlesArray, descriptionText } =
-      await buildSummarizeOpenAIPayload({ videoConfig, userConfig })
+    const {
+      openAiPayload,
+      userKey,
+      baseUrl,
+      cacheContext,
+      videoId,
+      title,
+      subtitlesArray,
+      descriptionText,
+      plan,
+      chunks,
+      modelTarget,
+      detailTokens,
+    } = await buildSummarizeOpenAIPayload({ videoConfig, userConfig })
+
+    // 长视频：多 chunk map-reduce job（幂等、可续传、可取消），完成后一次性流式回写全文
+    if (plan === 'job') {
+      const apiKey = await selectApiKeyAndActivatedLicenseKey(userKey, videoId)
+      const historyUser = await resolveHistoryUser(req, res)
+      const result = await runSummaryToCompletion({
+        videoConfig,
+        userConfig,
+        title,
+        chunks: toJobChunkSpecs(chunks),
+        model: modelTarget.model,
+        provider: modelTarget.provider,
+        baseUrl: modelTarget.baseUrl,
+        promptVersion: cacheContext.promptVersion,
+        detailTokens,
+        apiKey,
+      })
+
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8')
+      res.setHeader('Cache-Control', 'no-cache')
+      res.setHeader('X-Bibi-Job-Id', result.jobId)
+      await writeWebStreamToNodeResponse(summaryTextToStream(result.summaryText), res)
+
+      if (isValidSummaryText(result.summaryText)) {
+        await persistChatHistory({
+          historyUser,
+          videoConfig,
+          shouldShowTimestamp: userConfig?.shouldShowTimestamp,
+          videoId,
+          title,
+          subtitlesArray,
+          descriptionText,
+          model: modelTarget.model,
+          summaryText: result.summaryText,
+        })
+      }
+      return
+    }
+
     const openaiApiKey = await selectApiKeyAndActivatedLicenseKey(userKey, videoId)
     const streamResult = await fetchOpenAIResult(
       { ...openAiPayload, stream: true },
@@ -59,16 +124,26 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     if (streamResult instanceof ReadableStream) {
       const finalText = await writeWebStreamToNodeResponse(streamResult, res)
-      await persistChatHistory({ ...persistParams, summaryText: finalText })
+      // provider 错误页/HTML 不落库（流已按旧行为写出，仅拦截持久化）
+      if (isValidSummaryText(finalText)) {
+        await persistChatHistory({ ...persistParams, summaryText: finalText })
+      }
       return
     }
 
     res.status(200).send(streamResult)
-    await persistChatHistory({ ...persistParams, summaryText: String(streamResult) })
+    if (isValidSummaryText(String(streamResult))) {
+      await persistChatHistory({ ...persistParams, summaryText: String(streamResult) })
+    }
   } catch (error: any) {
     if (error instanceof SummarizeRequestError) {
       console.error(error.message)
       return res.status(error.statusCode).send(toHttpErrorMessage(error.statusCode, error.message))
+    }
+    if (error instanceof JobFailureError) {
+      console.error(`[chat] job failed (${error.code}): ${error.message}`)
+      const statusCode = jobErrorToHttpStatus(error.code)
+      return res.status(statusCode).send(toHttpErrorMessage(statusCode, `${error.code}: ${error.message}`))
     }
     const classified = classifyUpstreamError(error)
     console.error(`${classified.kind}: ${classified.message}`)
