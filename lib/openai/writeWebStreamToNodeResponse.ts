@@ -3,8 +3,10 @@ import type { NextApiResponse } from 'next'
 export async function writeWebStreamToNodeResponse(
   stream: ReadableStream<Uint8Array<ArrayBufferLike>>,
   res: NextApiResponse,
-) {
+): Promise<string> {
   const reader = stream.getReader()
+  const decoder = new TextDecoder()
+  let text = ''
 
   try {
     while (true) {
@@ -13,9 +15,12 @@ export async function writeWebStreamToNodeResponse(
         break
       }
       if (value) {
-        res.write(Buffer.from(value))
+        const chunk = Buffer.from(value)
+        res.write(chunk)
+        text += decoder.decode(value, { stream: true })
       }
     }
+    text += decoder.decode()
     res.end()
   } catch (error) {
     // Headers/body were already sent; destroying the socket is the only way to
@@ -25,4 +30,5 @@ export async function writeWebStreamToNodeResponse(
   } finally {
     reader.releaseLock()
   }
+  return text
 }

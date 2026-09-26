@@ -10,7 +10,7 @@ import {
   THINKING_MODEL_MIN_OUTPUT_TOKENS,
 } from '~/lib/models/registry'
 import { CacheIdContext } from '~/lib/models/types'
-import { SummarizeParams } from '~/lib/types'
+import { CommonSubtitleItem, SummarizeParams } from '~/lib/types'
 import { isDev } from '~/utils/env'
 
 export class SummarizeRequestError extends Error {
@@ -30,6 +30,9 @@ export async function buildSummarizeOpenAIPayload({ videoConfig, userConfig }: S
   cacheContext: CacheIdContext
   modelTarget: ReturnType<typeof resolveModelTarget>
   videoId: string
+  title: string | null
+  subtitlesArray: Array<CommonSubtitleItem> | null
+  descriptionText: string | undefined
 }> {
   const { userKey, baseUrl, shouldShowTimestamp } = userConfig || {}
   const { videoId } = videoConfig
@@ -77,5 +80,15 @@ export async function buildSummarizeOpenAIPayload({ videoConfig, userConfig }: S
 
   const cacheContext = resolveCacheIdContext({ baseUrl, model: videoConfig.model })
 
-  return { openAiPayload, userKey, baseUrl: modelTarget.baseUrl, cacheContext, modelTarget, videoId }
+  return {
+    openAiPayload,
+    userKey,
+    baseUrl: modelTarget.baseUrl,
+    cacheContext,
+    modelTarget,
+    videoId,
+    title: title ?? null,
+    subtitlesArray: subtitlesArray ?? null,
+    descriptionText,
+  }
 }

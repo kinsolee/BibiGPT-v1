@@ -4,6 +4,7 @@ import { fetchOpenAIResult } from '~/lib/openai/fetchOpenAIResult'
 import { selectApiKeyAndActivatedLicenseKey } from '~/lib/openai/selectApiKeyAndActivatedLicenseKey'
 import { classifyUpstreamError } from '~/lib/models/errors'
 import { SummarizeParams } from '~/lib/types'
+import { persistChatHistory, resolveHistoryUser } from '~/lib/history/persistChatHistory'
 import { writeWebStreamToNodeResponse } from '~/lib/openai/writeWebStreamToNodeResponse'
 
 if (!process.env.OPENAI_API_KEY && !process.env.OPENAI_COMPATIBLE_API_KEY) {
@@ -30,10 +31,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   }
 
   try {
-    const { openAiPayload, userKey, baseUrl, cacheContext, videoId } = await buildSummarizeOpenAIPayload({
-      videoConfig,
-      userConfig,
-    })
+    const { openAiPayload, userKey, baseUrl, cacheContext, videoId, title, subtitlesArray, descriptionText } =
+      await buildSummarizeOpenAIPayload({ videoConfig, userConfig })
     const openaiApiKey = await selectApiKeyAndActivatedLicenseKey(userKey, videoId)
     const streamResult = await fetchOpenAIResult(
       { ...openAiPayload, stream: true },
@@ -42,16 +41,30 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       baseUrl,
       cacheContext,
     )
+    // 在响应写出前解析会话，避免流式结束后 auth-helpers 无法写 cookie
+    const historyUser = await resolveHistoryUser(req, res)
+    const persistParams = {
+      historyUser,
+      videoConfig,
+      shouldShowTimestamp: userConfig?.shouldShowTimestamp,
+      videoId,
+      title,
+      subtitlesArray,
+      descriptionText,
+      model: openAiPayload.model,
+    }
 
     res.setHeader('Content-Type', 'text/plain; charset=utf-8')
     res.setHeader('Cache-Control', 'no-cache')
 
     if (streamResult instanceof ReadableStream) {
-      await writeWebStreamToNodeResponse(streamResult, res)
+      const finalText = await writeWebStreamToNodeResponse(streamResult, res)
+      await persistChatHistory({ ...persistParams, summaryText: finalText })
       return
     }
 
     res.status(200).send(streamResult)
+    await persistChatHistory({ ...persistParams, summaryText: String(streamResult) })
   } catch (error: any) {
     if (error instanceof SummarizeRequestError) {
       console.error(error.message)
