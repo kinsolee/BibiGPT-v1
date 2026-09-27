@@ -210,7 +210,35 @@ export class UploadStoreError extends Error {
   }
 }
 
+/**
+ * per-fileId 串行锁：把「读 offset → 校验 → 追加 → 更新 meta」变成原子的
+ * read-modify-write。否则两个同 offset 的并发 PUT 会同时读到相同 current
+ * 值并双双 append，损坏 blob 且续传 offset 与文件内容错位。
+ * （跨进程安全由 offset 协议兜底：不一致即 409，客户端按 receivedBytes 重同步。）
+ */
+const sessionLocks = new Map<string, Promise<unknown>>()
+
+function withSessionLock<T>(fileId: string, fn: () => Promise<T>): Promise<T> {
+  const previous = sessionLocks.get(fileId) ?? Promise.resolve()
+  const result = previous.then(fn, fn)
+  const tail = result.then(
+    () => undefined,
+    () => undefined,
+  )
+  void tail.then(() => {
+    if (sessionLocks.get(fileId) === tail) {
+      sessionLocks.delete(fileId)
+    }
+  })
+  sessionLocks.set(fileId, tail)
+  return result
+}
+
 export async function appendChunk(fileId: string, offset: number, data: Buffer): Promise<UploadSessionSummary> {
+  return withSessionLock(fileId, () => appendChunkLocked(fileId, offset, data))
+}
+
+async function appendChunkLocked(fileId: string, offset: number, data: Buffer): Promise<UploadSessionSummary> {
   if (!isValidFileId(fileId)) {
     throw new UploadStoreError(400, `invalid fileId: ${fileId}`)
   }
@@ -248,6 +276,10 @@ export async function completeUpload(fileId: string): Promise<UploadSessionSumma
   if (!isValidFileId(fileId)) {
     throw new UploadStoreError(400, `invalid fileId: ${fileId}`)
   }
+  return withSessionLock(fileId, () => completeUploadLocked(fileId))
+}
+
+async function completeUploadLocked(fileId: string): Promise<UploadSessionSummary> {
   const meta = await readMeta(fileId)
   if (!meta) {
     throw new UploadStoreError(404, `upload session not found: ${fileId}`)

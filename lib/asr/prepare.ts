@@ -28,8 +28,27 @@ export interface PreparedAsrAudio {
   cleanup: () => Promise<void>
 }
 
-function hasFfmpegBin(): boolean {
-  return Boolean(getFfmpegBin())
+/**
+ * 真实探测 ffmpeg 可执行性：getFfmpegBin() 恒返回非空字符串，字面量
+ * 'ffmpeg' 在无安装环境同样不可用；按二进制路径缓存探测结果（测试通过
+ * BIBI_FFMPEG_PATH 切换路径时各自独立探测）。
+ */
+const ffmpegAvailability = new Map<string, Promise<boolean>>()
+
+export function isFfmpegAvailable(): Promise<boolean> {
+  const bin = getFfmpegBin()
+  const cached = ffmpegAvailability.get(bin)
+  if (cached) {
+    return cached
+  }
+  const probe = execFileAsync(bin, ['-version'], { timeout: 10_000, maxBuffer: 1024 * 1024 })
+    .then(() => true)
+    .catch((error: any) => {
+      // 二进制存在但 -version 异常退出仍视为可用；不存在/不可执行则不可用
+      return !(error?.code === 'ENOENT' || error?.code === 'EACCES')
+    })
+  ffmpegAvailability.set(bin, probe)
+  return probe
 }
 
 /**
@@ -44,12 +63,12 @@ export async function prepareAudioChunks(filePath: string): Promise<PreparedAsrA
   if (info.size <= ASR_MAX_REQUEST_BYTES) {
     return { chunks: [{ path: filePath, offsetSeconds: 0 }], cleanup: async () => {} }
   }
-  if (!hasFfmpegBin()) {
+  if (!(await isFfmpegAvailable())) {
     throw new SourceError(
       'NO_TRANSCRIPT',
       `音频 ${(info.size / 1024 / 1024).toFixed(
         1,
-      )}MB 超过单次转写上限 24MB，且本机无 ffmpeg 可分段；请安装 ffmpeg 或换小文件`,
+      )}MB 超过单次转写上限 24MB，且本机无可用 ffmpeg（BIBI_FFMPEG_PATH 可指定路径）可分段；请安装 ffmpeg 或换小文件`,
     )
   }
 
@@ -91,7 +110,16 @@ export async function prepareAudioChunks(filePath: string): Promise<PreparedAsrA
       ],
       { timeout: 30 * 60_000, maxBuffer: 8 * 1024 * 1024 },
     )
+  } catch (error: any) {
+    await rm(workDir, { recursive: true, force: true })
+    // 可用性探测与真实执行之间二进制可能消失，ENOENT 仍按可操作错误 fail closed
+    if (error?.code === 'ENOENT') {
+      throw new SourceError('NO_TRANSCRIPT', '本机无可用 ffmpeg，无法分段转写（BIBI_FFMPEG_PATH 可指定路径）')
+    }
+    throw error
+  }
 
+  try {
     const listCsv = await readFile(path.join(workDir, 'list.csv'), 'utf8')
     const starts = new Map<string, number>()
     for (const line of listCsv.split('\n')) {

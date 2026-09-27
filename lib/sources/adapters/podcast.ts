@@ -27,20 +27,45 @@ function hostMatchesExtra(host: string, extra: string[]): boolean {
 }
 
 /** 白名单：RSS/Atom 形态 URL（.xml/.rss 后缀、常见 feed 主机、env 追加），显式拒绝内网/云元数据地址 */
+/** 显式拒绝的内网/云元数据主机（SSRF 防护，feed 与音频下载共用同一策略） */
+function isBlockedHost(host: string): boolean {
+  return (
+    host === 'localhost' ||
+    host === '0.0.0.0' ||
+    host.endsWith('.local') ||
+    host.endsWith('.internal') ||
+    /^(127\.|10\.|192\.168\.|169\.254\.)/.test(host) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(host)
+  )
+}
+
+function isHostAllowed(host: string): boolean {
+  // 测试等场景可显式追加：BIBI_PODCAST_EXTRA_HOSTS
+  return !isBlockedHost(host) || hostMatchesExtra(host, getExtraPodcastHosts())
+}
+
+/** http(s) + 主机策略（内网/元数据段默认拒绝，env 可显式放行） */
+function isAllowedHttpUrl(raw: string | URL): boolean {
+  let url: URL
+  try {
+    url = raw instanceof URL ? raw : new URL(raw)
+  } catch {
+    return false
+  }
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+    return false
+  }
+  return isHostAllowed(url.hostname.toLowerCase())
+}
+
+/** 白名单：RSS/Atom 形态 URL（.xml/.rss 后缀、常见 feed 主机、env 追加） */
 export function isPodcastFeedUrl(url: URL): boolean {
   if (url.protocol !== 'https:' && url.protocol !== 'http:') {
     return false
   }
   const host = url.hostname.toLowerCase()
-  if (
-    host === 'localhost' ||
-    host.endsWith('.local') ||
-    host.endsWith('.internal') ||
-    /^(127\.|10\.|192\.168\.|169\.254\.|0\.0\.0\.0$)/.test(host) ||
-    /^172\.(1[6-9]|2\d|3[01])\./.test(host)
-  ) {
-    // 测试等场景可显式追加：BIBI_PODCAST_EXTRA_HOSTS
-    return hostMatchesExtra(host, getExtraPodcastHosts())
+  if (!isHostAllowed(host)) {
+    return false
   }
   if (FEED_PATH_PATTERN.test(url.pathname)) {
     return true
@@ -49,6 +74,14 @@ export function isPodcastFeedUrl(url: URL): boolean {
     return true
   }
   return hostMatchesExtra(host, getExtraPodcastHosts())
+}
+
+/**
+ * 音频下载目标校验：enclosure URL 直接来自不可信 RSS XML，主机策略必须与
+ * feed 白名单一致（不含 feed 形态要求），且后续每一跳重定向都复检。
+ */
+export function isSafePodcastAudioUrl(raw: string): boolean {
+  return isAllowedHttpUrl(raw)
 }
 
 export interface PodcastEpisode {
@@ -104,8 +137,6 @@ export function parseItunesDuration(raw: string | undefined): number | undefined
   return parts.reduce((accumulator, part) => accumulator * 60 + part, 0)
 }
 
-const AUDIO_EXT_PATTERN = /\.(mp3|m4a|aac|ogg|opus|wav)(\?|$)/i
-
 export function parsePodcastFeed(xml: string): ParsedFeed {
   const itemBlocks = xml.match(/<item[\s\S]*?<\/item>/gi) ?? []
   const entryBlocks = itemBlocks.length ? [] : xml.match(/<entry[\s\S]*?<\/entry>/gi) ?? []
@@ -142,15 +173,37 @@ function episodeTimeoutMs(): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 10 * 60_000
 }
 
-async function fetchWithLimit(url: string, label: string): Promise<Response> {
+const MAX_REDIRECTS = 5
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308])
+
+/**
+ * SSRF 加固 fetch：禁用自动重定向，初始 URL 与每一跳重定向目标都按
+ * 与 feed 白名单同一套主机策略复检后才继续，防止白名单内 feed 借
+ * enclosure/重定向把服务器引向内网或云元数据地址。
+ */
+async function fetchWithLimit(url: string, label: string, redirectsLeft = MAX_REDIRECTS): Promise<Response> {
+  if (!isAllowedHttpUrl(url)) {
+    throw new SourceError('SOURCE_UNAVAILABLE', `目标地址不在允许范围（SSRF 防护）: ${url}`)
+  }
   let response: Response
   try {
-    response = await fetch(url, { signal: AbortSignal.timeout(episodeTimeoutMs()) })
+    response = await fetch(url, { redirect: 'manual', signal: AbortSignal.timeout(episodeTimeoutMs()) })
   } catch (error: any) {
     if (error?.name === 'TimeoutError' || error?.code === 'ABORT_ERR') {
       throw new SourceError('SOURCE_UNAVAILABLE', `下载超时（${label}）: ${url}`)
     }
     throw new SourceError('SOURCE_UNAVAILABLE', `下载失败（${label}）: ${url}`)
+  }
+  if (REDIRECT_STATUSES.has(response.status)) {
+    const location = response.headers.get('location')
+    if (!location) {
+      throw new SourceError('SOURCE_UNAVAILABLE', `重定向缺少 Location（${label}）: ${url}`)
+    }
+    if (redirectsLeft <= 0) {
+      throw new SourceError('SOURCE_UNAVAILABLE', `重定向次数超限（${label}）: ${url}`)
+    }
+    const next = new URL(location, url).toString()
+    return fetchWithLimit(next, label, redirectsLeft - 1)
   }
   if (!response.ok) {
     if (response.status === 429) {
@@ -256,6 +309,9 @@ export const podcastAdapter: SourceAdapter = {
     const { episode, index } = selectEpisode(feed, url.searchParams.get('ep'))
     if (!episode.audioUrl) {
       throw new SourceError('NO_TRANSCRIPT', `条目「${episode.title}」没有音频附件（fail closed，不生成伪转写）`)
+    }
+    if (!isSafePodcastAudioUrl(episode.audioUrl)) {
+      throw new SourceError('SOURCE_UNAVAILABLE', `enclosure URL 不在允许范围（SSRF 防护）: ${episode.audioUrl}`)
     }
 
     const maxDownloadBytes = Number(process.env.BIBI_PODCAST_MAX_DOWNLOAD_BYTES) || 2 * 1024 * 1024 * 1024
