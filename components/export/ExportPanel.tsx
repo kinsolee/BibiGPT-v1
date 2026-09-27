@@ -24,6 +24,28 @@ const LEGACY_LOCALSTORAGE_KEYS: Record<string, string> = {
   lark_webhook: 'user-lark-webhook',
 }
 
+/**
+ * 读取 legacy 集成配置：useLocalStorage 写入时做了 JSON.stringify，
+ * 存储值形如 '"https://flomoapp.com/iwh/..."'（带引号字面量），需先 JSON.parse；
+ * 历史上可能存在未经编码的裸值，解析失败时按原文回落。
+ */
+function readLegacyWebhookValue(storageKey: string): string | null {
+  const raw = window.localStorage.getItem(storageKey)
+  if (!raw) {
+    return null
+  }
+  try {
+    const parsed = JSON.parse(raw)
+    if (typeof parsed === 'string' && parsed.trim()) {
+      return parsed.trim()
+    }
+    return null
+  } catch {
+    const bare = raw.trim()
+    return bare || null
+  }
+}
+
 function integrationOf(integrations: ExportIntegrationDTO[], provider: string): ExportIntegrationDTO | null {
   return integrations.find((item) => item.provider === provider) ?? null
 }
@@ -77,7 +99,7 @@ export function ExportPanel({ currentVideoUrl }: { currentVideoUrl: string }) {
       .catch(() => undefined)
     // 检测旧版 localStorage 配置，提示一键迁移到服务端加密存储
     const pending = Object.entries(LEGACY_LOCALSTORAGE_KEYS)
-      .filter(([, storageKey]) => Boolean(window.localStorage.getItem(storageKey)))
+      .filter(([, storageKey]) => Boolean(readLegacyWebhookValue(storageKey)))
       .map(([provider]) => provider)
     setMigratable(pending)
     return () => {
@@ -178,7 +200,7 @@ export function ExportPanel({ currentVideoUrl }: { currentVideoUrl: string }) {
     try {
       for (const provider of migratable) {
         const storageKey = LEGACY_LOCALSTORAGE_KEYS[provider]
-        const value = window.localStorage.getItem(storageKey)
+        const value = readLegacyWebhookValue(storageKey)
         if (value) {
           await saveExportIntegration(provider, value)
           window.localStorage.removeItem(storageKey)
