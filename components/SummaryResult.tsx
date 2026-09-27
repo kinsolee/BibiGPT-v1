@@ -5,6 +5,7 @@ import { ArtifactsPanel } from '~/components/ArtifactsPanel'
 import { ExportPanel } from '~/components/export/ExportPanel'
 import Sentence from '~/components/Sentence'
 import { useToast } from '~/hooks/use-toast'
+import { VisionPanel } from '~/components/vision/VisionPanel'
 import { formatSummary } from '~/utils/formatSummary'
 
 export let isSecureContext = false
@@ -69,6 +70,7 @@ export function SummaryResult({
       </div>
       <ActionsAfterResult curVideo={currentVideoUrl} onCopy={handleCopy} summaryNote={formattedSummary} />
       <ArtifactsPanel currentVideoUrl={currentVideoUrl} currentVideoId={currentVideoId} />
+      <VisionPanel currentVideoUrl={currentVideoUrl} currentVideoId={currentVideoId} />
       <ExportPanel currentVideoUrl={currentVideoUrl} />
     </div>
   )
