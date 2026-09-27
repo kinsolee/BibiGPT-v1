@@ -1,5 +1,13 @@
 /** /api/v1 的 OpenAPI 3.0 契约描述（fixture 同步断言其覆盖 submit/status/result/import） */
 
+const idempotencyKeyParam = {
+  name: 'Idempotency-Key',
+  in: 'header',
+  required: false,
+  description: '写操作幂等键：同 key 同 body 重放首次结果，同 key 不同 body 返回 409；最长 200 字符，超长返回 400',
+  schema: { type: 'string', maxLength: 200 },
+}
+
 function v1ErrorResponse(description: string) {
   return {
     description,
@@ -133,6 +141,7 @@ export const v1OpenApiSpec = {
         summary: '提交摘要任务（异步）',
         description:
           '入队即返回 202，轮询 GET /jobs/{jobId}。支持 Idempotency-Key 头：重复提交同 key 同 body 返回首次结果。导入/提交本身不会同步阻塞到摘要完成。',
+        parameters: [idempotencyKeyParam],
         requestBody: { content: { 'application/json': { schema: { $ref: '#/components/schemas/SubmitRequest' } } } },
         responses: {
           '202': {
@@ -164,7 +173,7 @@ export const v1OpenApiSpec = {
     '/import': {
       post: {
         summary: '批量导入 URL 到 Watch Later（绝不触发摘要）',
-        parameters: [{ name: 'Idempotency-Key', in: 'header', schema: { type: 'string' }, required: false }],
+        parameters: [idempotencyKeyParam],
         requestBody: { content: { 'application/json': { schema: { $ref: '#/components/schemas/ImportRequest' } } } },
         responses: {
           '200': {

@@ -34,7 +34,12 @@ function toItem(row: WatchLaterRow): V1WatchLaterItem {
   }
 }
 
-/** 默认 watch-later 读取：复用 KIN-45 的 collections/collection_items，(added_at, position) 游标分页 */
+/**
+ * 默认 watch-later 读取：复用 KIN-45 的 collections/collection_items。
+ * 游标为 (added_at, position, id) 稳定全序：批量插入会把 position 重置为 0..n
+ * 且不同批次的 added_at 可能相同（now() 语句级默认值），必须用 item id 作
+ * tie-breaker，否则按 (added_at, position) 翻页会静默跳过后批的行。
+ */
 export function createSupabaseWatchLaterReader(supabase: SupabaseClient): V1WatchLaterReader {
   return {
     async list(userId, { cursor, limit }) {
@@ -47,12 +52,13 @@ export function createSupabaseWatchLaterReader(supabase: SupabaseClient): V1Watc
         .eq('collection_id', collection.id)
       if (cursor) {
         query = query.or(
-          `added_at.gt."${cursor.addedAt}",and(added_at.eq."${cursor.addedAt}",position.gt.${cursor.position})`,
+          `added_at.gt."${cursor.addedAt}",and(added_at.eq."${cursor.addedAt}",position.gt.${cursor.position}),and(added_at.eq."${cursor.addedAt}",position.eq.${cursor.position},id.gt."${cursor.id}")`,
         )
       }
       const { data, error } = await query
         .order('added_at', { ascending: true })
         .order('position', { ascending: true })
+        .order('id', { ascending: true })
         .limit(limit + 1)
       if (error) {
         throw error
@@ -63,7 +69,7 @@ export function createSupabaseWatchLaterReader(supabase: SupabaseClient): V1Watc
       const last = page[page.length - 1]
       return {
         items: page.map(toItem),
-        nextCursor: hasMore && last ? { addedAt: last.added_at, position: last.position } : null,
+        nextCursor: hasMore && last ? { addedAt: last.added_at, position: last.position, id: last.id } : null,
         collection: {
           id: collection.id,
           title: collection.title,

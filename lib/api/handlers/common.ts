@@ -93,8 +93,11 @@ export async function checkRateLimit(
 /**
  * Idempotency-Key 编排：同 key 同 body 重放首次结果（Idempotency-Replayed: true），
  * 同 key 不同 body → 409 IDEMPOTENCY_CONFLICT。仅存确定性结果（<500 且非 429）。
- * store 故障时降级为直接执行（fail-open），不阻断请求。
+ * 超过 MAX_IDEMPOTENCY_KEY_LENGTH 的 key 直接 400（不截断——共享前缀的两个
+ * 长 key 会被误判为同一操作）。store 故障时降级为直接执行（fail-open）。
  */
+export const MAX_IDEMPOTENCY_KEY_LENGTH = 200
+
 export async function withV1Idempotency(
   req: NextApiRequest,
   res: NextApiResponse,
@@ -109,7 +112,14 @@ export async function withV1Idempotency(
     res.status(status).json(body)
     return
   }
-  const storeKey = `${route}:${ctx.tokenId}:${key.slice(0, 200)}`
+  if (key.length > MAX_IDEMPOTENCY_KEY_LENGTH) {
+    sendV1Error(
+      res,
+      new V1Error('INVALID_REQUEST', `Idempotency-Key must be at most ${MAX_IDEMPOTENCY_KEY_LENGTH} characters`),
+    )
+    return
+  }
+  const storeKey = `${route}:${ctx.tokenId}:${key}`
   let bodyHash: string
   try {
     bodyHash = await requestBodyHash(req.body ?? null)

@@ -22,6 +22,8 @@ export interface V1WatchLaterItem {
 export interface V1WatchLaterCursor {
   addedAt: string
   position: number
+  /** tie-breaker：同 added_at 批次的 position 会重置，(added_at, position) 不唯一，id 保证全序 */
+  id: string
 }
 
 export interface V1WatchLaterListResult {
@@ -86,7 +88,7 @@ export async function handleV1WatchLaterList(
   })
 }
 
-/** cursor 为 base64url(JSON {addedAt, position})，配合 (added_at, position) 稳定排序 */
+/** cursor 为 base64url(JSON {addedAt, position, id})，配合 (added_at, position, id) 稳定全序 */
 export function encodeWatchLaterCursor(cursor: V1WatchLaterCursor): string {
   return Buffer.from(JSON.stringify(cursor), 'utf8').toString('base64url')
 }
@@ -96,11 +98,17 @@ export function decodeWatchLaterCursor(raw: string): V1WatchLaterCursor | null {
     const parsed = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8')) as {
       addedAt?: unknown
       position?: unknown
+      id?: unknown
     }
-    if (typeof parsed.addedAt !== 'string' || typeof parsed.position !== 'number') {
+    if (
+      typeof parsed.addedAt !== 'string' ||
+      typeof parsed.position !== 'number' ||
+      typeof parsed.id !== 'string' ||
+      !parsed.id
+    ) {
       return null
     }
-    return { addedAt: parsed.addedAt, position: parsed.position }
+    return { addedAt: parsed.addedAt, position: parsed.position, id: parsed.id }
   } catch {
     return null
   }

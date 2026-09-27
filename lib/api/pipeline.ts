@@ -15,6 +15,7 @@ import type { MediaDocumentMetadata } from '~/lib/history/types'
 import { VideoService } from '~/lib/types'
 import type { VideoConfig } from '~/lib/types'
 import { getServiceSupabase } from './supabaseService'
+import { recordJobOwner } from './jobOwnership'
 import { v1ErrorFromSourceCode } from './errors'
 import { V1Error } from './errors'
 import type { V1SubmitInput, V1SubmitOutcome, V1SubmitPipeline } from './handlers/submit'
@@ -154,6 +155,8 @@ export const v1SubmitPipeline: V1SubmitPipeline = async ({
   }
   const digest = buildSummaryJobDigest(jobInput)
   const jobId = `job_${digest}`
+  // 登记 job 访问权（同源同配置的 jobId 跨用户共享，读端点凭此校验归属）
+  recordJobOwner(jobId, userId)
   const engine = getSharedJobEngine()
   const supabase = getServiceSupabase()
 

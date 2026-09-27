@@ -8,7 +8,8 @@ import { authenticateV1, checkRateLimit } from './common'
 
 /**
  * job 读取由路由层注入（默认实现 lib/api/jobReader.ts 走 lib/jobs engine）。
- * videoConfig 携带来源信息，handler 用它反查已落库的 contentId。
+ * reader 必须按 userId 校验归属（job digest 不含用户标识，jobId 跨用户共享），
+ * 无权时返回 null → 404。videoConfig 携带来源信息，handler 用它反查已落库的 contentId。
  */
 export interface V1JobView {
   status: JobStatus
@@ -21,7 +22,7 @@ export interface V1JobView {
 }
 
 export interface V1JobReader {
-  get(jobId: string): Promise<V1JobView | null>
+  get(jobId: string, userId: string): Promise<V1JobView | null>
 }
 
 /** GET /api/v1/jobs/{id} → { jobId, status, error, contentId }（contentId 为契约细化附加字段） */
@@ -52,7 +53,7 @@ export async function handleV1JobsGet(
   }
   let job: V1JobView | null = null
   try {
-    job = await reader.get(id)
+    job = await reader.get(id, auth.userId)
   } catch {
     job = null
   }

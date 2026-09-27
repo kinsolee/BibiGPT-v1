@@ -349,6 +349,38 @@ test('submit: GET → 405', async () => {
   assert.ok(recorded.headers['allow'])
 })
 
+test('submit: Idempotency-Key 超长 → 400 且不执行管线；200 字符以内不受影响', async () => {
+  const harness = await makeHarnessAsync()
+  const { pipeline, calls } = makeSubmitPipeline()
+  const tooLong = fakeRes()
+  await handleV1Submit(
+    fakeReq({
+      method: 'POST',
+      headers: { ...writeAuth(harness.writeToken), 'idempotency-key': 'k'.repeat(201) },
+      body: { sourceUrl: 'https://www.youtube.com/watch?v=a' },
+    }),
+    tooLong.res,
+    harness.deps,
+    pipeline,
+  )
+  assert.equal(tooLong.recorded.status, 400)
+  assert.equal((tooLong.recorded.body as { error: { code: string } }).error.code, 'INVALID_REQUEST')
+  assert.equal(calls.length, 0)
+
+  const atLimit = fakeRes()
+  await handleV1Submit(
+    fakeReq({
+      method: 'POST',
+      headers: { ...writeAuth(harness.writeToken), 'idempotency-key': 'k'.repeat(200) },
+      body: { sourceUrl: 'https://www.youtube.com/watch?v=a' },
+    }),
+    atLimit.res,
+    harness.deps,
+    pipeline,
+  )
+  assert.equal(atLimit.recorded.status, 202)
+})
+
 // ---------------------------------------------------------------- import 契约
 
 function makeImporter(): { importer: V1Importer; calls: Array<{ userId: string; items: unknown[] }> } {
@@ -497,15 +529,17 @@ function makeJobReader(impl: V1JobReader['get']): V1JobReader {
   return { get: impl }
 }
 
-test('jobs: 查询 running job → 200 { jobId, status, error, contentId }', async () => {
+test('jobs: 查询 running job → 200 { jobId, status, error, contentId }，handler 传入 auth.userId', async () => {
   const harness = await makeHarnessAsync()
-  const reader = makeJobReader((jobId) =>
-    Promise.resolve({
+  const seen: Array<{ jobId: string; userId: string }> = []
+  const reader = makeJobReader((jobId, userId) => {
+    seen.push({ jobId, userId })
+    return Promise.resolve({
       status: 'running',
       error: null,
       videoConfig: { service: 'youtube', videoId: 'abc', pageNumber: null },
-    }),
-  )
+    })
+  })
   const { res, recorded } = fakeRes()
   await handleV1JobsGet(
     fakeReq({ method: 'GET', headers: writeAuth(harness.writeToken), query: { id: 'job_x' } }),
@@ -515,9 +549,10 @@ test('jobs: 查询 running job → 200 { jobId, status, error, contentId }', asy
   )
   assert.equal(recorded.status, 200)
   assert.deepEqual(recorded.body, { jobId: 'job_x', status: 'running', error: null, contentId: null })
+  assert.deepEqual(seen, [{ jobId: 'job_x', userId: '00000000-0000-0000-0000-000000000001' }])
 })
 
-test('jobs: 未知 job → 404 NOT_FOUND；failed job 透传 JobError', async () => {
+test('jobs: 未知 job → 404 NOT_FOUND；非归属用户 → 404；failed job 透传 JobError', async () => {
   const harness = await makeHarnessAsync()
   const missing = fakeRes()
   await handleV1JobsGet(
@@ -528,6 +563,21 @@ test('jobs: 未知 job → 404 NOT_FOUND；failed job 透传 JobError', async ()
   )
   assert.equal(missing.recorded.status, 404)
   assert.equal((missing.recorded.body as { error: { code: string } }).error.code, 'NOT_FOUND')
+
+  // 归属校验：reader 模拟「该用户未登记访问权」→ null → 404（不泄漏存在性）
+  const forbiddenUser = '11111111-0000-0000-0000-000000000009'
+  const unauthorized = fakeRes()
+  await handleV1JobsGet(
+    fakeReq({ method: 'GET', headers: writeAuth(harness.writeToken), query: { id: 'job_of_other_user' } }),
+    unauthorized.res,
+    harness.deps,
+    makeJobReader((_jobId, userId) =>
+      userId === forbiddenUser
+        ? Promise.resolve({ status: 'failed', error: { code: 'UPSTREAM_TIMEOUT', message: 'secret' } })
+        : Promise.resolve(null),
+    ),
+  )
+  assert.equal(unauthorized.recorded.status, 404)
 
   const failed = fakeRes()
   await handleV1JobsGet(
@@ -545,6 +595,21 @@ test('jobs: 未知 job → 404 NOT_FOUND；failed job 透传 JobError', async ()
 })
 
 // ---------------------------------------------------------------- result / transcript 契约
+
+test('jobOwnership: 内存兜底下登记后本人可读、他人拒绝（无 Redis 时与 MemoryJobStore 对称）', async () => {
+  const { recordJobOwner, isJobAccessible } = await import('../jobOwnership')
+  const sourceKey = { service: 'youtube', sourceRef: 'youtube:video:abc', sourcePage: null }
+  recordJobOwner('job_owner_fixture', 'user-a')
+  assert.equal(await isJobAccessible({ supabase: null, jobId: 'job_owner_fixture', userId: 'user-a', sourceKey }), true)
+  assert.equal(
+    await isJobAccessible({ supabase: null, jobId: 'job_owner_fixture', userId: 'user-b', sourceKey }),
+    false,
+  )
+  assert.equal(
+    await isJobAccessible({ supabase: null, jobId: 'job_never_registered', userId: 'user-a', sourceKey }),
+    false,
+  )
+})
 
 function makeContentReader(overrides: Partial<V1ContentReader> = {}): V1ContentReader {
   return {
@@ -687,7 +752,10 @@ function makeWatchLaterReader(recordedOptions: Array<{ cursor: unknown; limit: n
             finishedAt: null,
           },
         ],
-        nextCursor: options.cursor === null ? { addedAt: '2026-09-27T00:00:00+00:00', position: 0 } : null,
+        nextCursor:
+          options.cursor === null
+            ? { addedAt: '2026-09-27T00:00:00+00:00', position: 0, id: 'iiiiiiii-0000-0000-0000-000000000001' }
+            : null,
         collection: { id: 'coll-1', title: '稍后再看', batchStatus: 'idle' },
       }
     },
@@ -710,7 +778,11 @@ test('watch-later: 列表 + cursor 分页字段；默认 limit=50；坏 cursor �
   assert.equal(body.items.length, 1)
   assert.equal(body.collection.title, '稍后再看')
   assert.equal(typeof body.cursor, 'string')
-  assert.ok(Buffer.from(String(body.cursor), 'base64url').toString().includes('addedAt'))
+  // cursor 三分量（addedAt/position/id）：同 added_at 批次 position 重置时靠 id 保全序
+  const decodedCursor = JSON.parse(Buffer.from(String(body.cursor), 'base64url').toString()) as Record<string, unknown>
+  assert.equal(decodedCursor.addedAt, '2026-09-27T00:00:00+00:00')
+  assert.equal(decodedCursor.position, 0)
+  assert.equal(decodedCursor.id, 'iiiiiiii-0000-0000-0000-000000000001')
   assert.equal(recordedOptions[0].limit, 50)
   assert.equal(recordedOptions[0].cursor, null)
 
