@@ -9,6 +9,7 @@ import { selectApiKeyAndActivatedLicenseKey } from '~/lib/openai/selectApiKeyAnd
 import type { BuiltSummarizeRequest } from '~/lib/openai/buildSummarizeRequest'
 import { ChatGPTAgent, fetchOpenAIResult, OpenAIStreamPayload } from '~/lib/openai/fetchOpenAIResult'
 import { buildChunkUserPrompt, buildReduceUserPrompt, SectionRange } from '~/lib/jobs/prompts'
+import { buildSummaryCacheEnvelope, writeSummaryCacheEntry } from '~/lib/observability/summaryCache'
 import { JobEngine, JobFailureError, StepRunner } from '~/lib/jobs/engine'
 import { JobChunkSpec, JobSnapshot, SummaryJobParams } from '~/lib/jobs/types'
 import { getDefaultJobStore } from '~/lib/jobs/store'
@@ -310,11 +311,12 @@ export function resetSharedJobEngine() {
 }
 
 /**
- * job 最终结果回写 canonical 缓存 key（原始 videoConfig 口径，与
- * fetchOpenAIResult 的 cacheCompletedResult 一致：裸 string、fail-open）。
+ * job 最终结果回写 canonical 缓存 key（原始 videoConfig 口径）。proxy 无
+ * transcript 只能读 tx-unhashed 变体，handler 读主 key miss 后也回退到它，
+ * 因此 key 保持无 transcriptHash 口径不变；格式与 fetchOpenAIResult 一致走
+ * KIN-40 envelope + TTL（读端 legacy 纯文本解码仅为旧数据兜底）。
  * 否则 reduce 只写 `#reduce` 合成 key，middleware/proxy 查原始 key 命中旧摘要，
  * 会拦截后续请求到不了 digest-aware job。
- * 注意：KIN-40 合并后若缓存改为 envelope 格式，只需调整本函数（唯一接线点）。
  */
 export async function writeJobResultToCanonicalCache(input: SummaryJobInput, summaryText: string): Promise<void> {
   if (!summaryText.trim()) {
@@ -325,9 +327,13 @@ export async function writeJobResultToCanonicalCache(input: SummaryJobInput, sum
   }
   try {
     const redis = Redis.fromEnv()
-    const cacheId = getCacheId(input.videoConfig, resolveCacheIdContext({ baseUrl: input.baseUrl, model: input.model }))
-    await redis.set(cacheId, summaryText)
-    console.info(`[jobs] canonical cache updated: ${cacheId}`)
+    const context = resolveCacheIdContext({ baseUrl: input.baseUrl, model: input.model })
+    const cacheId = getCacheId(input.videoConfig, context)
+    const envelope = buildSummaryCacheEnvelope({ text: summaryText, context, model: input.model })
+    const written = await writeSummaryCacheEntry(redis, cacheId, envelope)
+    if (written) {
+      console.info(`[jobs] canonical cache updated: ${cacheId}`)
+    }
   } catch (error) {
     // 回写失败不影响 job 结果本身，与摘要主链路的缓存语义一致（fail-open）
     console.error('[jobs] canonical cache write failed:', error)

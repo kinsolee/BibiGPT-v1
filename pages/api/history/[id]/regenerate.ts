@@ -4,8 +4,8 @@ import { persistSummarizedContent } from '~/lib/history/persist'
 import { requireUserId } from '~/lib/history/server'
 import { ContentRow, SummaryRow } from '~/lib/history/types'
 import { buildSummarizeOpenAIPayload } from '~/lib/openai/buildSummarizeRequest'
-import { fetchOpenAIResult } from '~/lib/openai/fetchOpenAIResult'
 import { selectApiKeyAndActivatedLicenseKey } from '~/lib/openai/selectApiKeyAndActivatedLicenseKey'
+import { summarizeFromBuiltRequest } from '~/lib/jobs/summaryJob'
 import { VideoConfig } from '~/lib/types'
 
 // 重新生成走完整生成链路（拉取最新字幕 → LLM → 落库），耗时较长
@@ -57,16 +57,16 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       pageNumber: contentRow.source_page,
     } as VideoConfig
 
-    const { openAiPayload, title, subtitlesArray, descriptionText } = await buildSummarizeOpenAIPayload({
+    const built = await buildSummarizeOpenAIPayload({
       videoConfig,
       userConfig: { shouldShowTimestamp: Boolean(storedConfig.showTimestamp) },
     })
     const apiKey = await selectApiKeyAndActivatedLicenseKey(undefined, contentRow.source_ref)
-    const regenerated = await fetchOpenAIResult({ ...openAiPayload, stream: false }, apiKey, videoConfig)
-    const summaryText = String(regenerated)
+    // job plan 下 openAiPayload 只含首 chunk，必须走统一入口分流 map-reduce 管线
+    const { text: summaryText } = await summarizeFromBuiltRequest(built)
 
-    const segments = subtitlesArray
-      ? commonSubtitlesToSegments(subtitlesArray, Boolean(storedConfig.showTimestamp))
+    const segments = built.subtitlesArray
+      ? commonSubtitlesToSegments(built.subtitlesArray, Boolean(storedConfig.showTimestamp))
       : []
     const persisted = await persistSummarizedContent({
       supabase: auth.supabase,
@@ -77,14 +77,14 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         service: contentRow.service,
         sourceRef: contentRow.source_ref,
         sourcePage: contentRow.source_page,
-        title: title ?? contentRow.title,
+        title: built.title ?? contentRow.title,
         duration: contentRow.duration,
         language: contentRow.language,
       },
       segments,
-      transcriptFullText: subtitlesArray ? null : descriptionText ?? null,
+      transcriptFullText: built.subtitlesArray ? null : built.descriptionText ?? null,
       config: toSummaryConfigSnapshot(videoConfig as Record<string, unknown>),
-      model: openAiPayload.model,
+      model: built.openAiPayload.model,
       summaryText,
     })
 
