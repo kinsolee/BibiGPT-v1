@@ -5,6 +5,7 @@ import React, { useEffect, useMemo, useState } from 'react'
 import { SubmitHandler, useForm } from 'react-hook-form'
 import useFormPersist from 'react-hook-form-persist'
 import { useAnalytics } from '~/components/context/analytics'
+import { ChatPanel } from '~/components/ChatPanel'
 import { PromptOptions } from '~/components/PromptOptions'
 import { SubmitButton } from '~/components/SubmitButton'
 import { SummaryResult } from '~/components/SummaryResult'
@@ -78,6 +79,8 @@ export const Home: NextPage<{
   // TODO: add mobx or state manager
   const [currentVideoId, setCurrentVideoId] = useState<string>('')
   const [currentVideoUrl, setCurrentVideoUrl] = useState<string>('')
+  // KIN-43：ChatPanel 定位已保存视频所需的来源键（与 currentVideoId 同步更新）
+  const [chatSource, setChatSource] = useState<{ service: string; pageNumber: string | null } | null>(null)
   const [userKey, setUserKey] = useLocalStorage<string>('user-openai-apikey')
   const [userBaseUrl, setUserBaseUrl] = useLocalStorage<string>('user-openai-base-url')
   const [oauthLoading, setOauthLoading] = useState(false)
@@ -157,6 +160,7 @@ export const Home: NextPage<{
     const service = parsed.adapter.id === VideoService.Youtube ? VideoService.Youtube : VideoService.Bilibili
 
     setCurrentVideoId(parsed.videoId)
+    setChatSource({ service, pageNumber })
     await summarize(
       { videoId: parsed.videoId, service, pageNumber, ...formValues },
       { userKey, baseUrl: userBaseUrl, shouldShowTimestamp },
@@ -269,6 +273,17 @@ export const Home: NextPage<{
           currentVideoUrl={currentVideoUrl}
           currentVideoId={currentVideoId}
           shouldShowTimestamp={shouldShowTimestamp}
+        />
+      )}
+      {summary && currentVideoId && chatSource && (
+        <ChatPanel
+          videoId={currentVideoId}
+          service={chatSource.service}
+          pageNumber={chatSource.pageNumber}
+          model={getValues('model')}
+          outputLanguage={getValues('outputLanguage')}
+          userKey={userKey}
+          baseUrl={userBaseUrl}
         />
       )}
     </div>
