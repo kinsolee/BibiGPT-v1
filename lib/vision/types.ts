@@ -69,7 +69,7 @@ export type ImageNoteRefs = {
   sourceRef: string
 }
 
-export type FrameAnalysisStatus = 'ok' | 'cached' | 'error'
+export type FrameAnalysisStatus = 'ok' | 'cached' | 'error' | 'skipped'
 
 export interface FrameAnalysisOutcome {
   frameId: string

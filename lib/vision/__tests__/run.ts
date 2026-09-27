@@ -6,12 +6,14 @@ import { hasFailures } from './harness'
 import { runAnalyzeCacheTests } from './analyzeCache.test'
 import { runFfmpegDeterminismTests } from './ffmpegDeterminism.test'
 import { runKeyframeSelectTests } from './keyframeSelect.test'
+import { runReviewFixesTests } from './reviewFixes.test'
 import { runVlmTests } from './vlm.test'
 
 async function main() {
   runKeyframeSelectTests()
   await runVlmTests()
   await runAnalyzeCacheTests()
+  await runReviewFixesTests()
   await runFfmpegDeterminismTests()
   if (hasFailures()) {
     process.exitCode = 1

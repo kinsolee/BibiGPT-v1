@@ -11,6 +11,7 @@ import type { ContentRow } from '~/lib/history/types'
 import { getMaxFrames, getMinGapSeconds, getSceneThreshold, isAudioIllustrationsEnabled } from './config'
 import { detectSceneTimes, extractFrameJpegs, readFrameBytes } from './ffmpegScenes'
 import { computeKeyframeSetId, selectKeyframes } from './keyframeSelect'
+import { assertSafePublicImageUrl } from './urlGuard'
 import { resolveVisionMedia } from './media'
 import { computeKeyframesInputHash, loadKeyframeArtifact, persistKeyframeSet } from './persist'
 import type { KeyframeSetPayload, VisionFrame } from './types'
@@ -31,6 +32,11 @@ async function fetchSourceImages(videoUrl: string): Promise<MediaImage[]> {
 
 function buildIllustrationId(url: string): string {
   return `illu_${createHash('sha1').update(url).digest('hex').slice(0, 12)}`
+}
+
+/** 图文笔记/插图的稳定图片 ID（sha1(url)），imageId → 已落库 URL 的定位键 */
+export function illustrationIdFor(url: string): string {
+  return buildIllustrationId(url)
 }
 
 export async function generateKeyframeSet(params: {
@@ -169,23 +175,35 @@ export async function generateKeyframeSet(params: {
 }
 
 /** 读取帧图片字节并计算内容 hash（缓存键）；插图走 URL 下载，关键帧走磁盘 */
-export async function loadFrameImage(frame: {
-  setId: string | null
-  file?: string
-  url?: string
-}): Promise<{ base64: string; mime: string; frameHash: string }> {
+export async function loadFrameImage(
+  frame: {
+    setId: string | null
+    file?: string
+    url?: string
+  },
+  options?: { fetchImpl?: typeof fetch },
+): Promise<{ base64: string; mime: string; frameHash: string }> {
   let bytes: Buffer
+  let mime = 'image/jpeg'
   if (frame.setId && frame.file) {
     bytes = await readFrameBytes(frame.setId, frame.file)
   } else if (frame.url) {
-    const response = await fetch(frame.url, { signal: AbortSignal.timeout(30_000) })
+    // P1-1：URL 只能来自服务端落库数据，且必须通过公网 http(s) 守卫
+    assertSafePublicImageUrl(frame.url)
+    const fetchImpl = options?.fetchImpl ?? globalThis.fetch
+    const response = await fetchImpl(frame.url, { signal: AbortSignal.timeout(30_000) })
     if (!response.ok) {
       throw new SourceError('SOURCE_UNAVAILABLE', `插图下载失败（HTTP ${response.status}）: ${frame.url}`)
+    }
+    // P2-4：保留真实图片 MIME（PNG/WebP 等），缺失或非 image/* 时安全回退 JPEG
+    const contentType = response.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase()
+    if (contentType && /^image\//.test(contentType)) {
+      mime = contentType
     }
     bytes = Buffer.from(await response.arrayBuffer())
   } else {
     throw new SourceError('SOURCE_UNAVAILABLE', '帧引用缺少文件或 URL')
   }
   const frameHash = createHash('sha256').update(bytes).digest('hex')
-  return { base64: bytes.toString('base64'), mime: 'image/jpeg', frameHash }
+  return { base64: bytes.toString('base64'), mime, frameHash }
 }

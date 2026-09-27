@@ -1,8 +1,10 @@
 import type { NextApiRequest, NextApiResponse } from 'next'
+import type { SupabaseClient } from '@supabase/supabase-js'
 
 import { requireUserId } from '~/lib/history/server'
 import { analyzeFrameBatch } from '~/lib/vision/analyze'
-import { loadFrameAnalyses, loadKeyframeArtifact } from '~/lib/vision/persist'
+import { illustrationIdFor } from '~/lib/vision/generate'
+import { loadFrameAnalyses, loadKeyframeArtifact, loadImageNoteArtifact } from '~/lib/vision/persist'
 import { resolveVisionContent } from '~/lib/vision/media'
 import { sourceErrorCodeToHttpStatus, SourceError } from '~/lib/sources/types'
 import type { AnalyzeFrameRef } from '~/lib/vision/analyze'
@@ -12,9 +14,11 @@ export const config = { maxDuration: 300 }
 
 /**
  * POST /api/vision/frames/analyze
- * body: { videoUrl, frameId?/imageUrl?/imageId?, force? }
- * - frameId：分析已落库关键帧集合里的指定帧；省略则分析全部帧
- * - imageUrl(+imageId)：分析图文笔记/插图等外部图片
+ * body: { videoUrl, frameId?, imageId?, force? }
+ * - frameId：分析已落库关键帧集合里的指定帧（含音频插图 illu_*）；省略则分析全部帧
+ * - imageId：分析图文笔记缓存图片（id 由服务端 sha1(url) 派生）
+ * P1-1：不接受客户端直传 imageUrl；服务端 fetch 的 URL 只能来自已落库
+ * artifacts（keyframes payload / image_note_images 缓存），且过公网守卫。
  * 逐帧隔离错误；(frameHash, model) 缓存命中不重复调 VLM。
  */
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -29,7 +33,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   const body = (typeof req.body === 'string' ? JSON.parse(req.body) : req.body) as {
     videoUrl?: string
     frameId?: string | null
-    imageUrl?: string | null
     imageId?: string | null
     force?: boolean
   }
@@ -45,20 +48,21 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     }
 
     const frames: AnalyzeFrameRef[] = []
-    if (body.imageUrl) {
-      frames.push({
-        frameId: body.imageId || `img_${hashUrl(body.imageUrl)}`,
-        idx: null,
-        time: null,
-        setId: null,
-        url: body.imageUrl,
-      })
+    let analysesSetId: string | null = null
+    if (body.imageId) {
+      // imageId 只接受已落库图片：先查 keyframes 插图，再查图文笔记缓存
+      const imageUrl = await resolvePersistedImageUrl(auth.supabase, auth.userId, content.id, body.imageId)
+      if (!imageUrl) {
+        return res.status(404).json({ error: 'image_not_found', message: `未找到已保存的图片: ${body.imageId}` })
+      }
+      frames.push({ frameId: body.imageId, idx: null, time: null, setId: null, url: imageUrl })
     } else {
       const artifact = await loadKeyframeArtifact(auth.supabase, content.id)
       const payload = artifact?.payload as unknown as KeyframeSetPayload | undefined
       if (!payload) {
         return res.status(404).json({ error: 'KEYFRAMES_NOT_GENERATED', message: '请先生成关键帧' })
       }
+      analysesSetId = payload.setId
       const requested = body.frameId ?? null
       for (const frame of payload.frames) {
         if (requested && frame.id !== requested) {
@@ -85,12 +89,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       frames,
       force: body.force === true,
     })
-    const analyses = await loadFrameAnalyses(auth.supabase, content.id, body.imageUrl ? null : frames[0]?.setId ?? null)
+    const analyses = await loadFrameAnalyses(auth.supabase, content.id, analysesSetId)
     return res.status(200).json({
       results: batch.results,
       okCount: batch.okCount,
       cachedCount: batch.cachedCount,
       errorCount: batch.errorCount,
+      skippedCount: batch.skippedCount,
       analyses: dedupeByFrameId(analyses),
     })
   } catch (error) {
@@ -103,13 +108,23 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   }
 }
 
-function hashUrl(url: string): string {
-  // 非 crypto 场景的短标识：仅用于无 imageId 时的稳定兜底 ID
-  let hash = 0
-  for (let i = 0; i < url.length; i += 1) {
-    hash = (hash * 31 + url.charCodeAt(i)) | 0
+/** imageId → 已落库图片 URL：keyframes 插图优先，其次 image_note_images 缓存 */
+async function resolvePersistedImageUrl(
+  supabase: SupabaseClient,
+  userId: string,
+  contentId: string,
+  imageId: string,
+): Promise<string | null> {
+  const keyframes = await loadKeyframeArtifact(supabase, contentId)
+  const payload = keyframes?.payload as unknown as KeyframeSetPayload | undefined
+  const fromKeyframes = payload?.illustrations.find((item) => item.id === imageId)
+  if (fromKeyframes) {
+    return fromKeyframes.url
   }
-  return (hash >>> 0).toString(16).padStart(8, '0')
+  const note = await loadImageNoteArtifact(supabase, contentId)
+  const images = (note?.payload as { images?: Array<{ url: string }> } | undefined)?.images ?? []
+  const matched = images.find((image) => illustrationIdFor(image.url) === imageId)
+  return matched?.url ?? null
 }
 
 function dedupeByFrameId(analyses: FrameAnalysisPayload[]): FrameAnalysisPayload[] {

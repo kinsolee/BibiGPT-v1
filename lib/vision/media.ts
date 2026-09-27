@@ -5,6 +5,7 @@ import type { SupabaseClient } from '@supabase/supabase-js'
 
 import { parseLocalFileId } from '~/lib/sources/adapters/localFile'
 import { parseVideoSourceUrl } from '~/lib/sources/registry'
+import { buildBilibiliSourceRef, buildYoutubeSourceRef } from '~/lib/sources/sourceRef'
 import { SourceError } from '~/lib/sources/types'
 import { resolveCompletedUpload } from '~/lib/storage/localStore'
 import { probeMedia } from '~/lib/storage/mediaProbe'
@@ -19,7 +20,28 @@ export interface ResolvedVisionMedia {
   duration: number | null
 }
 
-/** videoUrl → 用户自己的 content 行（service/source_ref 口径与来源 adapter 一致） */
+/**
+ * 同一视频在 contents 表里可能有两种 source_ref 口径：
+ * - 旧主流程（/api/sumup → persistChatHistory）存裸 videoId（如 `BV1xx`、`dQw4…`）；
+ * - KIN-46 ingest 链路（videoId=document.sourceRef）存 canonical 引用
+ *   （`youtube:video:<id>`、`bilibili:video:<id>[:pN]`）。
+ * 两种都查，B 站分页号同时匹配 source_page 列与 canonical ref 内嵌的 :pN。
+ */
+function buildSourceRefCandidates(service: string, videoId: string, pageNumber?: string | null): string[] {
+  const refs = new Set<string>([videoId])
+  if (service === 'youtube') {
+    refs.add(buildYoutubeSourceRef(videoId))
+  }
+  if (service === 'bilibili') {
+    refs.add(buildBilibiliSourceRef(videoId))
+    if (pageNumber) {
+      refs.add(buildBilibiliSourceRef(videoId, pageNumber))
+    }
+  }
+  return Array.from(refs)
+}
+
+/** videoUrl → 用户自己的 content 行；兼容裸 videoId 与 canonical sourceRef 两种落库口径 */
 export async function resolveVisionContent(
   supabase: SupabaseClient,
   userId: string,
@@ -27,7 +49,7 @@ export async function resolveVisionContent(
   pageNumber?: string | null,
 ): Promise<ContentRow | null> {
   let service: string
-  let sourceRef: string
+  let videoId: string
   const url = (() => {
     try {
       return new URL(videoUrl)
@@ -39,31 +61,33 @@ export async function resolveVisionContent(
   const fileId = url ? parseLocalFileId(url) : undefined
   if (url?.protocol === 'bibi-local:' && fileId) {
     service = 'local'
-    sourceRef = `local:file:${fileId}`
+    videoId = fileId
   } else {
     const parsed = parseVideoSourceUrl(videoUrl)
     if (!parsed) {
       return null
     }
     service = parsed.adapter.id
-    sourceRef = parsed.videoId
+    videoId = parsed.videoId
   }
+  const refs = service === 'local' ? [`local:file:${videoId}`] : buildSourceRefCandidates(service, videoId, pageNumber)
 
-  const candidates = pageNumber ? [pageNumber, null] : [null]
-  for (const sourcePage of candidates) {
+  // 分 P：先精确匹配 source_page，再回退 null（ingest 落库的 canonical 行 source_page 为空）
+  const pageCandidates = pageNumber ? [pageNumber, null] : [null]
+  for (const sourcePage of pageCandidates) {
     let match = supabase
       .from('contents')
       .select('*')
       .eq('user_id', userId)
       .eq('service', service)
-      .eq('source_ref', sourceRef)
+      .in('source_ref', refs)
     match = sourcePage === null ? match.is('source_page', null) : match.eq('source_page', sourcePage)
-    const { data, error } = await match.maybeSingle()
+    const { data, error } = await match.limit(1)
     if (error) {
       throw error
     }
-    if (data) {
-      return data as ContentRow
+    if (data?.length) {
+      return data[0] as ContentRow
     }
   }
   return null

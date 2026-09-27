@@ -54,16 +54,17 @@ export function generateKeyframes(videoUrl: string, options?: { force?: boolean 
 }
 
 export interface AnalyzeFramesResponse {
-  results: Array<{ frameId: string; status: 'ok' | 'cached' | 'error'; error?: string }>
+  results: Array<{ frameId: string; status: 'ok' | 'cached' | 'error' | 'skipped'; error?: string }>
   okCount: number
   cachedCount: number
   errorCount: number
+  skippedCount: number
   analyses: FrameAnalysisPayload[]
 }
 
 export function analyzeFrames(
   videoUrl: string,
-  options?: { frameId?: string; imageUrl?: string; imageId?: string; force?: boolean },
+  options?: { frameId?: string; imageId?: string; force?: boolean },
 ): Promise<AnalyzeFramesResponse> {
   return requestJson<AnalyzeFramesResponse>('/api/vision/frames/analyze', {
     method: 'POST',
@@ -71,7 +72,6 @@ export function analyzeFrames(
     body: JSON.stringify({
       videoUrl,
       frameId: options?.frameId ?? null,
-      imageUrl: options?.imageUrl ?? null,
       imageId: options?.imageId ?? null,
       force: options?.force ?? false,
     }),

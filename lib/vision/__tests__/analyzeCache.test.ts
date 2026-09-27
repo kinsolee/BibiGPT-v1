@@ -5,103 +5,13 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
-import type { SupabaseClient } from '@supabase/supabase-js'
-
 import { analyzeFrameBatch, analyzeFrameRef } from '../analyze'
 import { computeKeyframeSetId } from '../keyframeSelect'
 import { computeKeyframesInputHash, persistKeyframeSet } from '../persist'
 import { check, checkEqual, resetSuite, summary } from './harness'
+import { createSupabaseStub, makeContentRow } from './supabaseStub'
 
-type Row = Record<string, any>
-
-interface QueryState {
-  filters: Array<(row: Row) => boolean>
-  orderCol?: string
-  orderAsc: boolean
-  limitN?: number
-}
-
-/** 最小 Supabase 桩：只实现 vision/persist 用到的链式查询 */
-function createSupabaseStub(): SupabaseClient {
-  const rows: Array<Row & { table: string }> = []
-  const makeBuilder = (table: string) => {
-    const state: QueryState = { filters: [], orderAsc: true }
-    const apply = (): Array<Row & { table: string }> => {
-      const matched = rows.filter((row) => row.table === table && state.filters.every((fn) => fn(row)))
-      if (state.orderCol) {
-        const col: string = state.orderCol
-        const asc = state.orderAsc
-        matched.sort((a, b) => (asc ? a[col] - b[col] : b[col] - a[col]))
-      }
-      return state.limitN !== undefined ? matched.slice(0, state.limitN) : matched
-    }
-    const builder: any = {
-      select() {
-        return builder
-      },
-      eq(col: string, value: any) {
-        state.filters.push((row) => row[col] === value)
-        return builder
-      },
-      contains(col: string, partial: Row) {
-        state.filters.push((row) => Object.entries(partial).every(([key, value]) => (row[col] as Row)?.[key] === value))
-        return builder
-      },
-      order(col: string, options?: { ascending?: boolean }) {
-        state.orderCol = col
-        state.orderAsc = options?.ascending !== false
-        return builder
-      },
-      limit(n: number) {
-        state.limitN = n
-        return builder
-      },
-      maybeSingle: async () => ({ data: apply()[0] ?? null, error: null }),
-      single: async () => ({ data: apply()[0], error: null }),
-      then(resolve: any, reject: any) {
-        return Promise.resolve({ data: apply(), error: null }).then(resolve, reject)
-      },
-      insert(payload: Row) {
-        const row: Row & { table: string } = { ...payload, table }
-        if (!row.id) {
-          row.id = `id_${rows.length}`
-        }
-        if (!row.version) {
-          row.version = 1
-        }
-        rows.push(row)
-        return {
-          select() {
-            return {
-              single: async () => ({ data: { version: row.version }, error: null }),
-            }
-          },
-        }
-      },
-    }
-    return builder
-  }
-  return {
-    from: (table: string) => makeBuilder(table),
-  } as unknown as SupabaseClient
-}
-
-const CONTENT = {
-  id: 'content-1',
-  user_id: 'user-1',
-  source_url: 'bibi-local:file/up_abc',
-  service: 'local',
-  source_ref: 'local:file:up_abc',
-  source_page: null,
-  title: 'test video',
-  duration: 90,
-  language: null,
-  source_metadata: {},
-  is_favorite: false,
-  last_summarized_at: null,
-  created_at: new Date().toISOString(),
-  updated_at: new Date().toISOString(),
-} as any
+const CONTENT = makeContentRow() as any
 
 const VLM_OK = async () => ({ ocr: '字', description: '描述', tags: ['t'] })
 

@@ -34,6 +34,16 @@ export function getVisionTimeoutMs(): number {
   return readNumberEnv('BIBI_VISION_TIMEOUT_MS', DEFAULT_VISION_TIMEOUT_MS, 1000, 600_000)
 }
 
+/** 批量分析的 VLM 并发数，env BIBI_VISION_ANALYZE_CONCURRENCY（1..8），缺省 3 */
+export function getAnalyzeConcurrency(): number {
+  return readNumberEnv('BIBI_VISION_ANALYZE_CONCURRENCY', 3, 1, 8)
+}
+
+/** 批量分析整体 deadline 毫秒（须小于 route maxDuration 300s），env BIBI_VISION_BATCH_DEADLINE_MS，缺省 240000 */
+export function getBatchDeadlineMs(): number {
+  return readNumberEnv('BIBI_VISION_BATCH_DEADLINE_MS', 240_000, 5000, 295_000)
+}
+
 /** VLM 模型；缺省回落既有 OpenAI 兼容默认模型 */
 export function getVisionModel(): string {
   return process.env.BIBI_VISION_MODEL?.trim() || getDefaultModelId()

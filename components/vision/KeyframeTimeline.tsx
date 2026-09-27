@@ -103,7 +103,12 @@ export function KeyframeTimeline({
       try {
         const result = await analyzeFrames(currentVideoUrl, { frameId, force })
         applyAnalyses(result.analyses)
-        if (result.errorCount > 0) {
+        if (result.skippedCount > 0) {
+          toast({
+            title: `已分析 ${result.okCount + result.cachedCount} 帧，${result.skippedCount} 帧因请求时限未跑`,
+            description: '已完成的帧已保存，再次点击「分析全部画面」可续跑剩余帧。',
+          })
+        } else if (result.errorCount > 0) {
           toast({
             variant: 'destructive',
             title: `有 ${result.errorCount} 帧分析失败`,
