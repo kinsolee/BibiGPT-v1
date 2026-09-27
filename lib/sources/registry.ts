@@ -1,8 +1,27 @@
 import { bilibiliAdapter, parseBilibiliVideoId } from './adapters/bilibili'
+import { douyinAdapter } from './adapters/douyin'
+import { kuaishouAdapter } from './adapters/kuaishou'
 import { parseYoutubeVideoId, youtubeAdapter } from './adapters/youtube'
+import { xiaohongshuAdapter } from './adapters/xiaohongshu'
+import { wechatAdapter } from './adapters/wechat'
 import type { SourceAdapter } from './types'
 
 export const sourceAdapters: SourceAdapter[] = [youtubeAdapter, bilibiliAdapter]
+
+/**
+ * KIN-46 新来源（社媒骨架）白名单：纯 JS 实现，客户端可安全引用。
+ * 本地文件/播客 RSS/无字幕 YouTube ASR 三个重型 adapter（依赖 fs/ffmpeg/
+ * yt-dlp）在 server-only 的 lib/sources/adapters/extendedRegistry.ts 注册，
+ * 避免静态进入客户端 bundle（webpack 禁 node: 内建模块）。
+ * /api/sumup 旧主流程（fetchSubtitle → buildSourceUrl 只认 youtube/bilibili）
+ * 与 sourceAdapters 均保持不变。
+ */
+export const extendedSourceAdapters: SourceAdapter[] = [
+  douyinAdapter,
+  kuaishouAdapter,
+  xiaohongshuAdapter,
+  wechatAdapter,
+]
 
 export function findSourceAdapter(rawUrl: string): SourceAdapter | undefined {
   let url: URL
