@@ -10,6 +10,8 @@ import { JobFailureError } from '~/lib/jobs/engine'
 import { jobErrorToHttpStatus } from '~/lib/jobs/errors'
 import { runSummaryToCompletion, startSummaryJobInBackground } from '~/lib/jobs/summaryJob'
 import { isValidSummaryText } from '~/lib/jobs/validation'
+import { ChatAskError, prepareChatAsk } from '~/lib/chat/ask'
+import type { ChatSourceKey } from '~/lib/chat/types'
 
 if (!process.env.OPENAI_API_KEY && !process.env.OPENAI_COMPATIBLE_API_KEY) {
   throw new Error('Missing env var for OpenAI-compatible provider API key')
@@ -17,10 +19,70 @@ if (!process.env.OPENAI_API_KEY && !process.env.OPENAI_COMPATIBLE_API_KEY) {
 
 type ChatBody = Partial<SummarizeParams> & {
   messages?: Array<{ role: string; content?: string }>
+  /** KIN-43：携带该字段时走视频内追问链路，否则保持原摘要行为 */
+  chatRequest?: {
+    service?: string
+    videoId?: string
+    pageNumber?: null | string
+    message?: string
+  }
 }
 
 function toHttpErrorMessage(statusCode: number, message: string) {
   return `${statusCode}::${message}`
+}
+
+/** KIN-43 视频内追问：消费持久化 messages 做多轮问答，返回带 [mm:ss] 引用的流式回答 */
+async function handleChatAsk(req: NextApiRequest, res: NextApiResponse, body: ChatBody) {
+  const { service, videoId, pageNumber, message } = body.chatRequest ?? {}
+  if (!service || !videoId || !message?.trim()) {
+    return res.status(400).send(toHttpErrorMessage(400, 'Missing service, videoId or message in chatRequest'))
+  }
+  // 会话解析必须在流式输出前完成：auth-helpers 需要在 res 上写会话 cookie
+  const historyUser = await resolveHistoryUser(req, res)
+  if (!historyUser) {
+    return res.status(401).send(toHttpErrorMessage(401, '登录后才能对视频追问'))
+  }
+
+  try {
+    const prepared = await prepareChatAsk({
+      supabase: historyUser.supabase,
+      userId: historyUser.userId,
+      source: { service, videoId, pageNumber: pageNumber ? String(pageNumber) : null } as ChatSourceKey,
+      question: message.trim(),
+      videoConfig: body.videoConfig,
+      userConfig: body.userConfig,
+    })
+
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8')
+    res.setHeader('Cache-Control', 'no-cache')
+
+    let finalText = ''
+    let streamCompleted = true
+    if (prepared.streamResult instanceof ReadableStream) {
+      const { tracked, completed } = trackCleanEnd(prepared.streamResult)
+      finalText = await writeWebStreamToNodeResponse(tracked, res)
+      streamCompleted = completed()
+    } else {
+      finalText = String(prepared.streamResult)
+      res.status(200).send(finalText)
+    }
+
+    // provider 错误页/HTML 不落库；流中途失败（socket 已 destroy）同样不落库
+    if (streamCompleted && isValidSummaryText(finalText)) {
+      await prepared.persist(finalText)
+    }
+  } catch (error: any) {
+    if (error instanceof ChatAskError) {
+      console.error(`[chat-ask] ${error.statusCode}: ${error.message}`)
+      return res.status(error.statusCode).send(toHttpErrorMessage(error.statusCode, error.message))
+    }
+    const classified = classifyUpstreamError(error)
+    console.error(`[chat-ask] ${classified.kind}: ${classified.message}`)
+    res
+      .status(classified.httpStatus)
+      .send(toHttpErrorMessage(classified.httpStatus, `${classified.kind}: ${classified.message}`))
+  }
 }
 
 function summaryTextToStream(text: string): ReadableStream<Uint8Array> {
@@ -33,13 +95,51 @@ function summaryTextToStream(text: string): ReadableStream<Uint8Array> {
   })
 }
 
+/**
+ * 包一层流以区分「完整结束」与「中途失败」：writeWebStreamToNodeResponse
+ * 在流错误时也会返回已收到的半截文本，chat 链路必须只在 clean end 后落库，
+ * 保证流式失败不会把半个回答持久化。
+ */
+function trackCleanEnd(stream: ReadableStream<Uint8Array>): {
+  tracked: ReadableStream<Uint8Array>
+  completed: () => boolean
+} {
+  let clean = false
+  const tracked = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const reader = stream.getReader()
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) {
+            break
+          }
+          controller.enqueue(value)
+        }
+        clean = true
+        controller.close()
+      } catch (error) {
+        controller.error(error)
+      } finally {
+        reader.releaseLock()
+      }
+    },
+  })
+  return { tracked, completed: () => clean }
+}
+
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== 'POST') {
     res.setHeader('Allow', 'POST')
     return res.status(405).send(toHttpErrorMessage(405, 'Method Not Allowed'))
   }
 
-  const { videoConfig, userConfig } = req.body as ChatBody
+  const body = req.body as ChatBody
+  if (body.chatRequest) {
+    return handleChatAsk(req, res, body)
+  }
+
+  const { videoConfig, userConfig } = body
   if (!videoConfig || !userConfig) {
     return res.status(400).send(toHttpErrorMessage(400, 'Missing videoConfig or userConfig'))
   }
