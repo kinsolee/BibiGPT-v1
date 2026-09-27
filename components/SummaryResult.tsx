@@ -2,6 +2,7 @@ import Markdown from 'marked-react'
 import React from 'react'
 import { ActionsAfterResult } from '~/components/ActionsAfterResult'
 import { ArtifactsPanel } from '~/components/ArtifactsPanel'
+import { ExportPanel } from '~/components/export/ExportPanel'
 import Sentence from '~/components/Sentence'
 import { useToast } from '~/hooks/use-toast'
 import { formatSummary } from '~/utils/formatSummary'
@@ -68,6 +69,7 @@ export function SummaryResult({
       </div>
       <ActionsAfterResult curVideo={currentVideoUrl} onCopy={handleCopy} summaryNote={formattedSummary} />
       <ArtifactsPanel currentVideoUrl={currentVideoUrl} currentVideoId={currentVideoId} />
+      <ExportPanel currentVideoUrl={currentVideoUrl} />
     </div>
   )
 }
