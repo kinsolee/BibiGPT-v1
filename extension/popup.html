@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>BibiGPT Watch Later</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header class="header">
+      <h1>BibiGPT Watch Later</h1>
+      <button id="toggle-settings" class="link" type="button">设置</button>
+    </header>
+
+    <section id="settings" class="settings hidden">
+      <label>
+        API 地址
+        <input id="api-base" type="url" placeholder="http://localhost:3000" />
+      </label>
+      <label>
+        API Token（scope: write）
+        <input id="api-token" type="password" placeholder="bvt_..." />
+      </label>
+      <div class="row">
+        <button id="save-settings" type="button">保存</button>
+        <span id="settings-status" class="status"></span>
+      </div>
+      <p class="hint">Token 由 BibiGPT 服务端管理端点创建（POST /api/v1/admin/tokens），可随时撤销；扩展不保存任何服务端密钥。</p>
+    </section>
+
+    <section id="tabs-panel">
+      <div class="row">
+        <label class="link"><input id="select-all" type="checkbox" checked /> 全选</label>
+        <span id="tab-count" class="status"></span>
+      </div>
+      <ul id="tab-list" class="tab-list"></ul>
+      <div class="actions">
+        <button id="import-btn" type="button">添加到 Watch Later</button>
+        <button id="summarize-btn" type="button" class="secondary" disabled title="仅未导入过的可总结；导入不会自动总结">开始总结（手动）</button>
+      </div>
+      <p class="hint">导入只登记、不自动总结；需要摘要时再点「开始总结（手动）」。</p>
+      <div id="result" class="result"></div>
+    </section>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

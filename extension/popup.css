@@ -1,0 +1,136 @@
+body {
+  width: 340px;
+  margin: 0;
+  padding: 12px;
+  font: 13px/1.5 -apple-system, 'Segoe UI', 'PingFang SC', sans-serif;
+  color: #1f2328;
+}
+h1 {
+  font-size: 14px;
+  margin: 0;
+}
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+.hidden {
+  display: none;
+}
+.link {
+  border: none;
+  background: none;
+  color: #0969da;
+  cursor: pointer;
+  padding: 0;
+}
+.settings {
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  padding: 10px;
+  margin-bottom: 10px;
+}
+.settings label {
+  display: block;
+  margin-bottom: 8px;
+}
+.settings input {
+  width: 100%;
+  box-sizing: border-box;
+  margin-top: 2px;
+  padding: 4px 6px;
+  border: 1px solid #d0d7de;
+  border-radius: 4px;
+}
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0;
+}
+button {
+  padding: 5px 10px;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  background: #f6f8fa;
+  cursor: pointer;
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+button.secondary {
+  background: #fff;
+}
+button:not(:disabled):hover {
+  background: #eef1f4;
+}
+.tab-list {
+  list-style: none;
+  margin: 6px 0;
+  padding: 0;
+  max-height: 220px;
+  overflow-y: auto;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+}
+.tab-list li {
+  display: flex;
+  gap: 6px;
+  padding: 5px 8px;
+  border-bottom: 1px solid #eaeef2;
+  align-items: flex-start;
+}
+.tab-list li:last-child {
+  border-bottom: none;
+}
+.tab-title {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tab-url {
+  color: #656d76;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+.actions button {
+  flex: 1;
+}
+#import-btn {
+  background: #1f883d;
+  border-color: #1f883d;
+  color: #fff;
+}
+#import-btn:not(:disabled):hover {
+  background: #1a7f37;
+}
+.hint {
+  color: #656d76;
+  font-size: 11px;
+  margin: 6px 0 0;
+}
+.status {
+  color: #656d76;
+}
+.result {
+  margin-top: 8px;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.result .ok {
+  color: #1a7f37;
+}
+.result .err {
+  color: #cf222e;
+}

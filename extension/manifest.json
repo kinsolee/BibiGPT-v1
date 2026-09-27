@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "BibiGPT Watch Later",
+  "version": "1.0.0",
+  "description": "采集当前窗口的 YouTube/Bilibili 视频 tab，多选加入 BibiGPT Watch Later。导入不自动总结，总结需手动开始。",
+  "permissions": ["tabs", "storage"],
+  "optional_host_permissions": ["http://*/*", "https://*/*"],
+  "background": { "service_worker": "background.js" },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "BibiGPT Watch Later"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.youtube.com/watch*",
+        "https://m.youtube.com/watch*",
+        "https://www.youtube.com/shorts/*",
+        "https://www.bilibili.com/video/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
